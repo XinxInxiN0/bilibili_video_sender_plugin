@@ -1,82 +1,57 @@
-在群里发送b站视频链接，麦麦就会自动解析并发送视频
-使用方法
-1.下载本插件
-2.把插件解压到麦麦的plugins目录
-3.下载ffmpeg(https://ffmpeg.org/)
-4.解压ffmpeg
-5.把ffmpeg放到bilibili_video_sender_plugin目录下
-6.打开config.toml并填入sessdata和buvid3（获取方式在下面）
-7.用的开心😊
-sessdata和buvid3获取
-1.打开浏览器并打开b站（以Chrome为例）
-2.按F12打开开发者工具
-<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/d8b040de-a038-4772-b588-26df92d5ce73" />
-3.找到Application或者应用一栏，点开
-<img width="1054" height="34" alt="image" src="https://github.com/user-attachments/assets/0b8a5954-d6cd-47b6-95b9-126115203907" />
-4.按F5刷新页面
-5.找到Cookie点开
-<img width="220" height="28" alt="image" src="https://github.com/user-attachments/assets/4dc9c217-f78d-4d68-bb00-71ace2d3381f" />
-6.找到bilibili点开
-<img width="292" height="29" alt="image" src="https://github.com/user-attachments/assets/d82e3b15-64cd-490b-8eea-c6258ca0f6e2" />
-7.Value一栏里边就是要找的东西
-<img width="714" height="483" alt="image" src="https://github.com/user-attachments/assets/607aa291-c927-4d00-8975-5e85fa0d1214" />
-8.把找到的sessdata和buvid3填到config.toml里就好了
-完成后的文件夹结构应该是这样的
-│  config.toml
-│  LICENSE
-│  plugin.py
-│  _manifest.json
-│
-└─ffmpeg
-    │  LICENSE
-    │  README.txt
-    │
-    ├─bin
-    │      ffmpeg.exe
-    │      ffplay.exe
-    │      ffprobe.exe
-    │
-    ├─doc
-    │      bootstrap.min.css
-    │      community.html
-    │      default.css
-    │      developer.html
-    │      faq.html
-    │      fate.html
-    │      ffmpeg-all.html
-    │      ffmpeg-bitstream-filters.html
-    │      ffmpeg-codecs.html
-    │      ffmpeg-devices.html
-    │      ffmpeg-filters.html
-    │      ffmpeg-formats.html
-    │      ffmpeg-protocols.html
-    │      ffmpeg-resampler.html
-    │      ffmpeg-scaler.html
-    │      ffmpeg-utils.html
-    │      ffmpeg.html
-    │      ffplay-all.html
-    │      ffplay.html
-    │      ffprobe-all.html
-    │      ffprobe.html
-    │      general.html
-    │      git-howto.html
-    │      libavcodec.html
-    │      libavdevice.html
-    │      libavfilter.html
-    │      libavformat.html
-    │      libavutil.html
-    │      libswresample.html
-    │      libswscale.html
-    │      mailing-list-faq.html
-    │      nut.html
-    │      platform.html
-    │      style.min.css
-    │
-    └─presets
-            libvpx-1080p.ffpreset
-            libvpx-1080p50_60.ffpreset
-            libvpx-360p.ffpreset
-            libvpx-720p.ffpreset
-            libvpx-720p50_60.ffpreset
+# 麦麦B站视频自动解析插件使用说明
+
+发送B站视频链接到群里，麦麦会自动解析并发送视频。
+
+---
+
+## 使用方法
+
+1. 下载本插件。
+2. 将插件解压到麦麦的 `plugins` 目录。
+3. 下载 [ffmpeg](https://ffmpeg.org/)。
+4. 解压 ffmpeg。
+5. 将解压后的 ffmpeg 文件夹放到 `bilibili_video_sender_plugin` 目录下。
+6. 打开 `config.toml`，填入 `sessdata` 和 `buvid3`（获取方法见下方）。
+7. 使用愉快 😊。
+
+---
+
+## sessdata 和 buvid3 获取方法
+
+1. 使用 Chrome 浏览器打开 B站主页。
+2. 按下 `F12` 打开开发者工具。
+3. 点击顶部的 `Application`（应用）选项卡。
+4. 按 `F5` 刷新页面。
+5. 在左侧栏找到 `Cookies` 并展开。
+6. 找到 `bilibili` 相关的 Cookie 并点击。
+7. 在右侧的 `Value` 列找到 `sessdata` 和 `buvid3` 的值。
+8. 将这两个值填入 `config.toml` 文件中对应的位置。
+
+### 参考截图
+
+- 开发者工具打开界面  
+  ![开发者工具界面](https://github.com/user-attachments/assets/d8b040de-a038-4772-b588-26df92d5ce73)
+
+- Application 栏  
+  ![Application 栏](https://github.com/user-attachments/assets/0b8a5954-d6cd-47b6-95b9-126115203907)
+
+- Cookie 位置  
+  ![Cookie 位置](https://github.com/user-attachments/assets/4dc9c217-f78d-4d68-bb00-71ace2d3381f)
+
+- bilibili Cookie  
+  ![bilibili Cookie](https://github.com/user-attachments/assets/d82e3b15-64cd-490b-8eea-c6258ca0f6e2)
+
+- sessdata 和 buvid3 示例  
+  ![sessdata 和 buvid3](https://github.com/user-attachments/assets/607aa291-c927-4d00-8975-5e85fa0d1214)
+
+---
+
+## 完成后的文件夹结构示例
+<img width="412" height="131" alt="image" src="https://github.com/user-attachments/assets/63ef60df-99f3-4c79-b124-da566fd15cd0" />
+<img width="659" height="182" alt="image" src="https://github.com/user-attachments/assets/ddeb422f-b9fc-49b6-a652-866d06eb812c" />
+
+## 使用效果
+<img width="1920" height="1020" alt="image" src="https://github.com/user-attachments/assets/220bc808-766d-4168-9936-afa83f0452a8" />
+
 
 
