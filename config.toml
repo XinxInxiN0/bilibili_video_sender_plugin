@@ -14,7 +14,7 @@ prefer_dash = true
 fnval = 4048
 
 # 允许 4K。与 fnval 的 128 位叠加
-fourk = false
+fourk = true
 
 # 期望清晰度 qn（DASH 下无效，留 0；MP4 时可设 16/32/64/80/112 等）
 qn = 0
