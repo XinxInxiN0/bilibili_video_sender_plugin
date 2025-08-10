@@ -21,8 +21,62 @@ sessdata和buvid3获取
 7.Value一栏里边就是要找的东西
 <img width="714" height="483" alt="image" src="https://github.com/user-attachments/assets/607aa291-c927-4d00-8975-5e85fa0d1214" />
 8.把找到的sessdata和buvid3填到config.toml里就好了
-
-
-
+完成后的文件夹结构应该是这样的
+│  config.toml
+│  LICENSE
+│  plugin.py
+│  _manifest.json
+│
+└─ffmpeg
+    │  LICENSE
+    │  README.txt
+    │
+    ├─bin
+    │      ffmpeg.exe
+    │      ffplay.exe
+    │      ffprobe.exe
+    │
+    ├─doc
+    │      bootstrap.min.css
+    │      community.html
+    │      default.css
+    │      developer.html
+    │      faq.html
+    │      fate.html
+    │      ffmpeg-all.html
+    │      ffmpeg-bitstream-filters.html
+    │      ffmpeg-codecs.html
+    │      ffmpeg-devices.html
+    │      ffmpeg-filters.html
+    │      ffmpeg-formats.html
+    │      ffmpeg-protocols.html
+    │      ffmpeg-resampler.html
+    │      ffmpeg-scaler.html
+    │      ffmpeg-utils.html
+    │      ffmpeg.html
+    │      ffplay-all.html
+    │      ffplay.html
+    │      ffprobe-all.html
+    │      ffprobe.html
+    │      general.html
+    │      git-howto.html
+    │      libavcodec.html
+    │      libavdevice.html
+    │      libavfilter.html
+    │      libavformat.html
+    │      libavutil.html
+    │      libswresample.html
+    │      libswscale.html
+    │      mailing-list-faq.html
+    │      nut.html
+    │      platform.html
+    │      style.min.css
+    │
+    └─presets
+            libvpx-1080p.ffpreset
+            libvpx-1080p50_60.ffpreset
+            libvpx-360p.ffpreset
+            libvpx-720p.ffpreset
+            libvpx-720p50_60.ffpreset
 
 
