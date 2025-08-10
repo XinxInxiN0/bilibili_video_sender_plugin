@@ -1,0 +1,36 @@
+[plugin]
+name = "bilibili_video_sender_plugin"
+version = "1.0.0"
+enabled = true
+
+[bilibili]
+# 是否使用 WBI 签名接口（推荐开启）
+use_wbi = true
+
+# 是否优先 DASH（推荐 true；如需 MP4 则置 false 并设置 fnval=1）
+prefer_dash = true
+
+# 指定 fnval（DASH: 16；HDR: 16|64；4K: 16|128；8K: 16|1024；全部: 4048）
+fnval = 4048
+
+# 允许 4K。与 fnval 的 128 位叠加
+fourk = false
+
+# 期望清晰度 qn（DASH 下无效，留 0；MP4 时可设 16/32/64/80/112 等）
+qn = 0
+
+# 平台 pc 或 html5。html5 更少防盗链但仅 MP4
+platform = "pc"
+
+# html5 平台下可使画质 1080p（仅 html5 生效）
+high_quality = false
+
+# 未登录高画质（尝试拉 64/80，效果视视频而定）
+try_look = false
+
+# 账号 Cookie：更高画质/大会员鉴权必需
+sessdata = "填你自己的sessdata"
+
+# 可选：用于生成 session 的 buvid3（浏览器 Cookie 中可获得）
+buvid3 = "填你自己的buvid3"
+

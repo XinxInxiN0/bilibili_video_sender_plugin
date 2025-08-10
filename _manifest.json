@@ -1,0 +1,31 @@
+{
+  "manifest_version": 1,
+  "name": "B站视频直链发送插件 (Bilibili Video Sender)",
+  "version": "1.0.0",
+  "description": "当收到包含哔哩哔哩视频链接的消息时，自动解析并发送可直连的播放地址与视频文件",
+  "author": {
+    "name": "U+4E50",
+    "url": "https://github.com/XinxInxiN0"
+  },
+  "license": "MIT",
+  "host_application": {
+    "min_version": "0.9.0"
+  },
+  "homepage_url": "https://github.com/XinxInxiN0",
+  "repository_url": "https://github.com/XinxInxiN0/bilibili_video_sender_plugin",
+  "config_file_name": "config.toml",
+  "keywords": ["bilibili", "video", "sender", "auto"],
+  "categories": ["Utilities", "Video"],
+  "default_locale": "zh-CN",
+  "plugin_info": {
+    "is_built_in": false,
+    "plugin_type": "utility",
+    "components": [],
+    "features": [
+      "自动识别B站链接",
+      "解析直链并发送",
+      "同时尝试发送视频文件",
+      "支持b23.tv短链"
+    ]
+  }
+}
