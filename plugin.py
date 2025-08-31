@@ -4,11 +4,14 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import re
 import tempfile
 import time
 import urllib.parse
 import urllib.request
+import subprocess
+import shutil
 
 from typing import Any, Dict, List, Optional, Tuple, Type
 
@@ -27,6 +30,173 @@ from src.plugin_system.base.component_types import (
 )
 from src.plugin_system.apis.plugin_register_api import register_plugin
 from src.plugin_system.apis import send_api
+
+
+class FFmpegManager:
+    """跨平台FFmpeg管理器"""
+
+    def __init__(self):
+        self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        self.system = platform.system().lower()
+        self.ffmpeg_dir = os.path.join(self.plugin_dir, 'ffmpeg')
+
+    def get_ffmpeg_path(self) -> Optional[str]:
+        """获取ffmpeg可执行文件路径"""
+        return self._get_executable_path('ffmpeg')
+
+    def get_ffprobe_path(self) -> Optional[str]:
+        """获取ffprobe可执行文件路径"""
+        return self._get_executable_path('ffprobe')
+
+    def _get_executable_path(self, executable_name: str) -> Optional[str]:
+        """根据操作系统获取可执行文件路径"""
+        # 延迟导入日志器，避免循环依赖
+        from src.common.logger import get_logger
+        logger = get_logger("ffmpeg_manager")
+
+        # 确定可执行文件名称和路径
+        if self.system == "windows":
+            bin_dir = os.path.join(self.ffmpeg_dir, 'bin')
+            executable_path = os.path.join(bin_dir, f'{executable_name}.exe')
+        elif self.system in ["linux", "darwin"]:  # Linux 和 macOS
+            # 优先检查平台特定的目录
+            platform_bin_dir = os.path.join(self.ffmpeg_dir, 'bin', self.system)
+            executable_path = os.path.join(platform_bin_dir, executable_name)
+
+            # 如果平台特定目录不存在，检查通用bin目录
+            if not os.path.exists(executable_path):
+                bin_dir = os.path.join(self.ffmpeg_dir, 'bin')
+                executable_path = os.path.join(bin_dir, executable_name)
+        else:
+            logger.warning(f"不支持的操作系统: {self.system}")
+            return None
+
+        # 检查插件内置的ffmpeg
+        if os.path.exists(executable_path):
+            logger.debug(f"找到插件内置{executable_name}: {executable_path}")
+            return executable_path
+
+        # 检查系统PATH中的ffmpeg
+        system_executable = shutil.which(executable_name)
+        if system_executable:
+            logger.debug(f"找到系统{executable_name}: {system_executable}")
+            return system_executable
+
+        logger.warning(f"未找到{executable_name}可执行文件")
+        return None
+
+    def check_ffmpeg_availability(self) -> Dict[str, Any]:
+        """检查FFmpeg可用性"""
+        from src.common.logger import get_logger
+        logger = get_logger("ffmpeg_manager")
+
+        result = {
+            "ffmpeg_available": False,
+            "ffprobe_available": False,
+            "ffmpeg_path": None,
+            "ffprobe_path": None,
+            "ffmpeg_version": None,
+            "system": self.system
+        }
+
+        # 检查ffmpeg
+        ffmpeg_path = self.get_ffmpeg_path()
+        if ffmpeg_path:
+            result["ffmpeg_available"] = True
+            result["ffmpeg_path"] = ffmpeg_path
+
+            try:
+                # 获取ffmpeg版本信息
+                cmd = [ffmpeg_path, '-version']
+                process = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                if process.returncode == 0:
+                    version_line = process.stdout.split('\n')[0] if process.stdout else ""
+                    result["ffmpeg_version"] = version_line
+                    logger.info(f"FFmpeg版本: {version_line}")
+            except Exception as e:
+                logger.warning(f"获取FFmpeg版本失败: {e}")
+
+        # 检查ffprobe
+        ffprobe_path = self.get_ffprobe_path()
+        if ffprobe_path:
+            result["ffprobe_available"] = True
+            result["ffprobe_path"] = ffprobe_path
+
+        logger.info(f"FFmpeg可用性检查结果: ffmpeg={result['ffmpeg_available']}, ffprobe={result['ffprobe_available']}")
+        return result
+
+
+# 全局FFmpeg管理器实例
+_ffmpeg_manager = FFmpegManager()
+
+
+def _prepare_split_dir() -> str:
+    """清理并准备插件内的 data/split 目录。
+    - 每次下载/分块前调用，确保目录存在且为空。
+    """
+    # 延迟导入日志器，避免循环依赖
+    from src.common.logger import get_logger
+
+    logger = get_logger("bilibili_handler")
+    plugin_dir = os.path.dirname(os.path.abspath(__file__))
+    split_dir = os.path.join(plugin_dir, "data", "split")
+    try:
+        if os.path.exists(split_dir):
+            shutil.rmtree(split_dir)
+        os.makedirs(split_dir, exist_ok=True)
+        logger.debug(f"分块输出目录: {split_dir}（已清理历史文件）")
+    except Exception as e:
+        logger.warning(f"准备分块目录失败: {e}")
+        os.makedirs(split_dir, exist_ok=True)
+    return split_dir
+
+
+class ProgressBar:
+    """进度条显示类"""
+    
+    def __init__(self, total_size: int, description: str = "下载进度", bar_length: int = 30):
+        self.total_size = total_size
+        self.description = description
+        self.bar_length = bar_length
+        self.current_size = 0
+        self.last_update = 0
+        self.update_interval = 0.1  # 100ms更新一次，避免过于频繁
+        
+    def update(self, downloaded: int):
+        """更新进度"""
+        self.current_size = downloaded
+        current_time = time.time()
+        
+        # 控制更新频率，避免过于频繁的日志输出
+        if current_time - self.last_update < self.update_interval:
+            return
+            
+        self.last_update = current_time
+        
+        # 计算进度百分比
+        if self.total_size > 0:
+            percentage = (downloaded / self.total_size) * 100
+        else:
+            percentage = 0
+            
+        # 计算进度条填充长度
+        filled_length = int(self.bar_length * downloaded // self.total_size) if self.total_size > 0 else 0
+        
+        # 构建进度条
+        bar = '█' * filled_length + '░' * (self.bar_length - filled_length)
+        
+        # 格式化文件大小显示
+        downloaded_mb = downloaded / (1024 * 1024)
+        total_mb = self.total_size / (1024 * 1024) if self.total_size > 0 else 0
+        
+        # 输出进度条
+        print(f"\r{self.description}: [{bar}] {percentage:5.1f}% ({downloaded_mb:6.1f}MB/{total_mb:6.1f}MB)", end='', flush=True)
+        
+    def finish(self):
+        """完成进度条显示"""
+        # 确保显示100%
+        self.update(self.total_size)
+        print()  # 换行
 
 
 class BilibiliVideoInfo:
@@ -149,10 +319,8 @@ class BilibiliParser:
         logger = get_logger("bilibili_handler")
         opts = options or {}
         
-        # 详细记录配置参数
-        logger.info(f"=== 开始获取视频播放地址 ===")
-        logger.info(f"视频ID: aid={aid}, cid={cid}")
-        logger.info(f"配置参数: {opts}")
+        # 配置参数
+        logger.info("开始获取视频播放地址")
         
         use_wbi = bool(opts.get("use_wbi", True))
         prefer_dash = bool(opts.get("prefer_dash", True))
@@ -165,24 +333,19 @@ class BilibiliParser:
         sessdata = str(opts.get("sessdata", "")).strip()
         buvid3 = str(opts.get("buvid3", "")).strip()
         
-        # 记录鉴权状态
+        # 鉴权状态
         has_cookie = bool(sessdata)
         has_buvid3 = bool(buvid3)
-        logger.info(f"鉴权状态: 有Cookie={has_cookie}, 有Buvid3={has_buvid3}")
         
-        if has_cookie:
-            logger.info(f"Cookie信息: SESSDATA长度={len(sessdata)}, Buvid3长度={len(buvid3)}")
-        else:
+        if not has_cookie:
             logger.warning("未提供Cookie，将使用游客模式（清晰度限制）")
         
         # 清晰度选择逻辑优化
         if qn == 0:
             if has_cookie:
                 qn = 64  # 登录后默认720P
-                logger.info("未指定清晰度，登录状态默认选择720P (qn=64)")
             else:
                 qn = 32  # 未登录默认480P
-                logger.info("未指定清晰度，游客状态默认选择480P (qn=32)")
         else:
             # 检查清晰度权限
             qn_info = {
@@ -198,7 +361,6 @@ class BilibiliParser:
                 126: "杜比视界"
             }
             qn_name = qn_info.get(qn, f"未知({qn})")
-            logger.info(f"指定清晰度: {qn_name} (qn={qn})")
             
             # 清晰度权限检查
             if qn >= 64 and not has_cookie:
@@ -223,39 +385,31 @@ class BilibiliParser:
         
         if qn > 0:
             params["qn"] = str(qn)
-            logger.info(f"添加清晰度参数: qn={qn}")
             
         if high_quality:
             params["high_quality"] = "1"
-            logger.info("启用高画质模式")
             
         if try_look:
             params["try_look"] = "1"
-            logger.info("启用游客高画质尝试模式")
             
         if buvid3:
             # 生成 session: md5(buvid3 + 当前毫秒)
             ms = str(int(time.time() * 1000))
             session_hash = hashlib.md5((buvid3 + ms).encode("utf-8")).hexdigest()
             params["session"] = session_hash
-            logger.info(f"生成session参数: {session_hash[:8]}...")
             
         # 添加gaia_source参数（有Cookie时非必要）
         if not has_cookie:
             params["gaia_source"] = "view-card"
-            logger.info("添加gaia_source参数: view-card")
 
         # WBI 签名
         api_base = (
             "https://api.bilibili.com/x/player/wbi/playurl" if use_wbi else "https://api.bilibili.com/x/player/playurl"
         )
-        logger.info(f"使用API: {api_base}")
-        logger.info(f"WBI签名: {use_wbi}")
         
         final_params = BilibiliWbiSigner.sign_params(params) if use_wbi else params
         query = urllib.parse.urlencode(final_params)
         api = f"{api_base}?{query}"
-        logger.info(f"完整请求URL: {api}")
 
         # 构建请求头：可带 Cookie
         headers: Dict[str, str] = {}
@@ -265,19 +419,14 @@ class BilibiliParser:
                 cookie_parts.append(f"buvid3={buvid3}")
             headers["Cookie"] = "; ".join(cookie_parts)
             headers["gaia_source"] = sessdata  # 添加 gaia_source
-            logger.info(f"添加Cookie头: {cookie_parts[0][:20]}...")
-            logger.info(f"添加gaia_source头: {sessdata[:10]}...")
         else:
-            logger.info("未添加Cookie头，使用游客模式")
+            logger.info("使用游客模式")
 
         # 发起请求
-        logger.info("开始发送HTTP请求...")
         try:
             req = BilibiliParser._build_request(api, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public API
                 data_bytes = resp.read()
-                logger.info(f"HTTP响应状态: {resp.status}")
-                logger.info(f"响应数据大小: {len(data_bytes)} bytes")
         except Exception as e:
             logger.error(f"HTTP请求失败: {e}")
             return [], f"网络请求失败: {e}"
@@ -286,7 +435,6 @@ class BilibiliParser:
             payload = json.loads(data_bytes.decode("utf-8", errors="ignore"))
         except Exception as e:
             logger.error(f"JSON解析失败: {e}")
-            logger.error(f"响应数据: {data_bytes[:200]}...")
             return [], "响应数据格式错误"
             
         if payload.get("code") != 0:
@@ -322,19 +470,32 @@ class BilibiliParser:
         logger.info(f"找到{len(videos)}个视频流和{len(audios)}个音频流")
         
         # 记录视频流详细信息
-        for i, video in enumerate(videos):
-            codec = video.get("codecs", "unknown")
-            bandwidth = video.get("bandwidth", 0)
-            width = video.get("width", 0)
-            height = video.get("height", 0)
-            frame_rate = video.get("frameRate", "unknown")
-            logger.info(f"视频流{i+1}: {width}x{height}, {codec}, {bandwidth//1000}kbps, {frame_rate}fps")
+        if videos:
+            logger.info("=" * 80)
+            logger.info("视频流信息:")
+            logger.info("-" * 80)
+            logger.info(f"{'序号':<4} {'分辨率':<12} {'编码格式':<25} {'比特率':<10} {'帧率':<10}")
+            logger.info("-" * 80)
+            for i, video in enumerate(videos):
+                codec = video.get("codecs", "unknown")
+                bandwidth = video.get("bandwidth", 0)
+                width = video.get("width", 0)
+                height = video.get("height", 0)
+                frame_rate = video.get("frameRate", "unknown")
+                logger.info(f"{i+1:<4} {width}x{height:<8} {codec:<25} {bandwidth//1000:<10}kbps {frame_rate:<10}")
+            logger.info("-" * 80)
         
         # 记录音频流详细信息
-        for i, audio in enumerate(audios):
-            codec = audio.get("codecs", "unknown")
-            bandwidth = audio.get("bandwidth", 0)
-            logger.info(f"音频流{i+1}: {codec}, {bandwidth//1000}kbps")
+        if audios:
+            logger.info("音频流信息:")
+            logger.info("-" * 80)
+            logger.info(f"{'序号':<4} {'编码格式':<25} {'比特率':<10}")
+            logger.info("-" * 80)
+            for i, audio in enumerate(audios):
+                codec = audio.get("codecs", "unknown")
+                bandwidth = audio.get("bandwidth", 0)
+                logger.info(f"{i+1:<4} {codec:<25} {bandwidth//1000:<10}kbps")
+            logger.info("-" * 80)
         
         # 参考原脚本，处理杜比和flac音频
         dolby_audios = []
@@ -344,19 +505,31 @@ class BilibiliParser:
         if dolby and dolby.get("audio"):
             dolby_audios = dolby.get("audio", [])
             logger.info(f"找到{len(dolby_audios)}个杜比音频流")
-            for i, audio in enumerate(dolby_audios):
-                codec = audio.get("codecs", "unknown")
-                bandwidth = audio.get("bandwidth", 0)
-                logger.info(f"杜比音频流{i+1}: {codec}, {bandwidth//1000}kbps")
+            if dolby_audios:
+                logger.info("杜比音频流信息:")
+                logger.info("-" * 80)
+                logger.info(f"{'序号':<4} {'编码格式':<25} {'比特率':<10}")
+                logger.info("-" * 80)
+                for i, audio in enumerate(dolby_audios):
+                    codec = audio.get("codecs", "unknown")
+                    bandwidth = audio.get("bandwidth", 0)
+                    logger.info(f"{i+1:<4} {codec:<25} {bandwidth//1000:<10}kbps")
+                logger.info("-" * 80)
         
         flac = dash.get("flac")
         if flac and flac.get("audio"):
             flac_audios = [flac.get("audio")]
             logger.info(f"找到{len(flac_audios)}个Flac音频流")
-            for audio in flac_audios:
-                codec = audio.get("codecs", "unknown")
-                bandwidth = audio.get("bandwidth", 0)
-                logger.info(f"Flac音频流: {codec}, {bandwidth//1000}kbps")
+            if flac_audios:
+                logger.info("Flac音频流信息:")
+                logger.info("-" * 80)
+                logger.info(f"{'序号':<4} {'编码格式':<25} {'比特率':<10}")
+                logger.info("-" * 80)
+                for i, audio in enumerate(flac_audios):
+                    codec = audio.get("codecs", "unknown")
+                    bandwidth = audio.get("bandwidth", 0)
+                    logger.info(f"{i+1:<4} {codec:<25} {bandwidth//1000:<10}kbps")
+                logger.info("-" * 80)
         
         # 合并所有音频流
         all_audios = audios + dolby_audios + flac_audios
@@ -430,9 +603,7 @@ class BilibiliParser:
         has_buvid3 = bool(buvid3)
         logger.info(f"强制DASH鉴权状态: 有Cookie={has_cookie}, 有Buvid3={has_buvid3}")
         
-        if has_cookie:
-            logger.info(f"强制DASH Cookie信息: SESSDATA长度={len(sessdata)}, Buvid3长度={len(buvid3)}")
-        else:
+        if not has_cookie:
             logger.warning("强制DASH未提供Cookie，可能影响高清晰度获取")
 
         params: Dict[str, Any] = {
@@ -445,29 +616,22 @@ class BilibiliParser:
             "platform": platform,
         }
         
-        logger.info(f"强制DASH参数: fnval={fnval}, fourk={fourk}, platform={platform}")
-        
         if buvid3:
             ms = str(int(time.time() * 1000))
             session_hash = hashlib.md5((buvid3 + ms).encode("utf-8")).hexdigest()
             params["session"] = session_hash
-            logger.info(f"强制DASH生成session参数: {session_hash[:8]}...")
             
         # 添加gaia_source参数（有Cookie时非必要）
         if not has_cookie:
             params["gaia_source"] = "view-card"
-            logger.info("强制DASH添加gaia_source参数: view-card")
 
         api_base = (
             "https://api.bilibili.com/x/player/wbi/playurl" if use_wbi else "https://api.bilibili.com/x/player/playurl"
         )
-        logger.info(f"强制DASH使用API: {api_base}")
-        logger.info(f"强制DASH WBI签名: {use_wbi}")
         
         final_params = BilibiliWbiSigner.sign_params(params) if use_wbi else params
         query = urllib.parse.urlencode(final_params)
         api = f"{api_base}?{query}"
-        logger.info(f"强制DASH完整请求URL: {api}")
 
         headers: Dict[str, str] = {}
         if sessdata:
@@ -476,18 +640,11 @@ class BilibiliParser:
                 cookie_parts.append(f"buvid3={buvid3}")
             headers["Cookie"] = "; ".join(cookie_parts)
             headers["gaia_source"] = sessdata  # 添加 gaia_source
-            logger.info(f"强制DASH添加Cookie头: {cookie_parts[0][:20]}...")
-            logger.info(f"强制DASH添加gaia_source头: {sessdata[:10]}...")
-        else:
-            logger.info("强制DASH未添加Cookie头")
 
-        logger.info("强制DASH开始发送HTTP请求...")
         try:
             req = BilibiliParser._build_request(api, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public API
                 data_bytes = resp.read()
-                logger.info(f"强制DASH HTTP响应状态: {resp.status}")
-                logger.info(f"强制DASH响应数据大小: {len(data_bytes)} bytes")
         except Exception as e:
             logger.error(f"强制DASH HTTP请求失败: {e}")
             return [], f"强制DASH网络请求失败: {e}"
@@ -496,7 +653,6 @@ class BilibiliParser:
             payload = json.loads(data_bytes.decode("utf-8", errors="ignore"))
         except Exception as e:
             logger.error(f"强制DASH JSON解析失败: {e}")
-            logger.error(f"强制DASH响应数据: {data_bytes[:200]}...")
             return [], "强制DASH响应数据格式错误"
             
         if payload.get("code") != 0:
@@ -530,20 +686,33 @@ class BilibiliParser:
         
         logger.info(f"强制DASH获取到{len(videos)}个视频流和{len(audios)}个音频流")
         
-        # 记录视频流详细信息
-        for i, video in enumerate(videos):
-            codec = video.get("codecs", "unknown")
-            bandwidth = video.get("bandwidth", 0)
-            width = video.get("width", 0)
-            height = video.get("height", 0)
-            frame_rate = video.get("frameRate", "unknown")
-            logger.info(f"强制DASH视频流{i+1}: {width}x{height}, {codec}, {bandwidth//1000}kbps, {frame_rate}fps")
+        # 记录视频流详细信息（表格格式）
+        if videos:
+            logger.info("=" * 80)
+            logger.info("强制DASH视频流信息:")
+            logger.info("-" * 80)
+            logger.info(f"{'序号':<4} {'分辨率':<12} {'编码格式':<25} {'比特率':<10} {'帧率':<10}")
+            logger.info("-" * 80)
+            for i, video in enumerate(videos):
+                codec = video.get("codecs", "unknown")
+                bandwidth = video.get("bandwidth", 0)
+                width = video.get("width", 0)
+                height = video.get("height", 0)
+                frame_rate = video.get("frameRate", "unknown")
+                logger.info(f"{i+1:<4} {width}x{height:<8} {codec:<25} {bandwidth//1000:<10}kbps {frame_rate:<10}")
+            logger.info("-" * 80)
         
-        # 记录音频流详细信息
-        for i, audio in enumerate(audios):
-            codec = audio.get("codecs", "unknown")
-            bandwidth = audio.get("bandwidth", 0)
-            logger.info(f"强制DASH音频流{i+1}: {codec}, {bandwidth//1000}kbps")
+        # 记录音频流详细信息（表格格式）
+        if audios:
+            logger.info("强制DASH音频流信息:")
+            logger.info("-" * 80)
+            logger.info(f"{'序号':<4} {'编码格式':<25} {'比特率':<10}")
+            logger.info("-" * 80)
+            for i, audio in enumerate(audios):
+                codec = audio.get("codecs", "unknown")
+                bandwidth = audio.get("bandwidth", 0)
+                logger.info(f"{i+1:<4} {codec:<25} {bandwidth//1000:<10}kbps")
+            logger.info("-" * 80)
         
         # 参考原脚本，处理杜比和flac音频
         dolby_audios = []
@@ -552,20 +721,30 @@ class BilibiliParser:
         dolby = dash.get("dolby")
         if dolby and dolby.get("audio"):
             dolby_audios = dolby.get("audio", [])
-            logger.info(f"强制DASH找到{len(dolby_audios)}个杜比音频流")
-            for i, audio in enumerate(dolby_audios):
-                codec = audio.get("codecs", "unknown")
-                bandwidth = audio.get("bandwidth", 0)
-                logger.info(f"强制DASH杜比音频流{i+1}: {codec}, {bandwidth//1000}kbps")
+            if dolby_audios:
+                logger.info("强制DASH杜比音频流信息:")
+                logger.info("-" * 80)
+                logger.info(f"{'序号':<4} {'编码格式':<25} {'比特率':<10}")
+                logger.info("-" * 80)
+                for i, audio in enumerate(dolby_audios):
+                    codec = audio.get("codecs", "unknown")
+                    bandwidth = audio.get("bandwidth", 0)
+                    logger.info(f"{i+1:<4} {codec:<25} {bandwidth//1000:<10}kbps")
+                logger.info("-" * 80)
         
         flac = dash.get("flac")
         if flac and flac.get("audio"):
             flac_audios = [flac.get("audio")]
-            logger.info(f"强制DASH找到{len(flac_audios)}个Flac音频流")
-            for audio in flac_audios:
-                codec = audio.get("codecs", "unknown")
-                bandwidth = audio.get("bandwidth", 0)
-                logger.info(f"强制DASH Flac音频流: {codec}, {bandwidth//1000}kbps")
+            if flac_audios:
+                logger.info("强制DASH Flac音频流信息:")
+                logger.info("-" * 80)
+                logger.info(f"{'序号':<4} {'编码格式':<25} {'比特率':<10}")
+                logger.info("-" * 80)
+                for i, audio in enumerate(flac_audios):
+                    codec = audio.get("codecs", "unknown")
+                    bandwidth = audio.get("bandwidth", 0)
+                    logger.info(f"{i+1:<4} {codec:<25} {bandwidth//1000:<10}kbps")
+                logger.info("-" * 80)
         
         all_audios = audios + dolby_audios + flac_audios
         
@@ -601,10 +780,10 @@ class BilibiliParser:
                 logger.info(f"强制DASH选择最佳音频流: {codec}, {bandwidth//1000}kbps")
         
         if len(candidates) >= 2:
-            logger.info(f"强制DASH成功获取完整的视频和音频流，共{len(candidates)}个地址")
+            logger.info("强制DASH成功获取完整的视频和音频流")
             return candidates, "ok"
         else:
-            logger.warning(f"强制DASH未获取到完整的视频和音频流，仅获取到{len(candidates)}个地址")
+            logger.warning("强制DASH未获取到完整的视频和音频流")
             return candidates, "未获取到完整的视频和音频流"
 
     @staticmethod
@@ -621,7 +800,7 @@ class BilibiliParser:
             "recommendations": []
         }
         
-        logger.info("=== 开始配置验证 ===")
+
         
         # 检查Cookie配置
         sessdata = str(opts.get("sessdata", "")).strip()
@@ -634,8 +813,6 @@ class BilibiliParser:
             if len(sessdata) < 10:
                 validation_result["errors"].append("SESSDATA长度异常，可能配置错误")
                 validation_result["valid"] = False
-            else:
-                logger.info(f"SESSDATA配置正常，长度: {len(sessdata)}")
                 
         if not buvid3:
             validation_result["warnings"].append("未配置Buvid3，session参数生成可能失败")
@@ -644,8 +821,7 @@ class BilibiliParser:
             if len(buvid3) < 10:
                 validation_result["errors"].append("Buvid3长度异常，可能配置错误")
                 validation_result["valid"] = False
-            else:
-                logger.info(f"Buvid3配置正常，长度: {len(buvid3)}")
+
         
         # 检查清晰度配置
         qn = int(opts.get("qn", 0))
@@ -684,8 +860,248 @@ class BilibiliParser:
         if validation_result["recommendations"]:
             logger.info(f"配置建议: {validation_result['recommendations']}")
             
-        logger.info(f"配置验证完成: {'通过' if validation_result['valid'] else '失败'}")
+        logger.info(f"配置验证: {'通过' if validation_result['valid'] else '失败'}")
         return validation_result
+
+    @staticmethod
+    def get_video_duration(video_path: str) -> Optional[float]:
+        """获取视频时长（秒）"""
+        try:
+            import subprocess
+
+            # 使用跨平台FFmpeg管理器获取ffprobe路径
+            ffprobe_path = _ffmpeg_manager.get_ffprobe_path()
+
+            if not ffprobe_path:
+                from src.common.logger import get_logger
+                logger = get_logger("bilibili_handler")
+                logger.warning("未找到ffprobe，无法获取视频时长")
+                return None
+
+            # 使用ffprobe获取视频时长
+            cmd = [ffprobe_path, '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', video_path]
+            from src.common.logger import get_logger
+            logger = get_logger("bilibili_handler")
+            logger.info(f"执行ffprobe命令获取视频时长: {' '.join(cmd)}")
+
+            # 使用正确的编码设置来避免跨平台编码问题
+            result = subprocess.run(cmd, capture_output=True, text=False)
+
+            logger.info(f"ffprobe返回码: {result.returncode}")
+            if result.stdout:
+                stdout_text = result.stdout.decode('utf-8', errors='replace').strip()
+                logger.info(f"ffprobe输出: {stdout_text}")
+            if result.stderr:
+                stderr_text = result.stderr.decode('utf-8', errors='replace').strip()
+                logger.info(f"ffprobe错误: {stderr_text}")
+
+            if result.returncode == 0:
+                duration_str = result.stdout.decode('utf-8', errors='replace').strip()
+                try:
+                    duration = float(duration_str)
+                    logger.info(f"成功获取视频时长: {duration}秒")
+                    return duration
+                except ValueError:
+                    logger.warning(f"无法解析视频时长字符串: '{duration_str}'")
+                    return None
+            else:
+                logger.warning(f"ffprobe命令执行失败，返回码: {result.returncode}")
+                return None
+        except Exception as e:
+            from src.common.logger import get_logger
+            logger = get_logger("bilibili_handler")
+            logger.error(f"获取视频时长时发生异常: {e}")
+            return None
+
+
+class VideoSplitter:
+    """视频分块处理类"""
+
+    def __init__(self, ffmpeg_path: Optional[str] = None):
+        self.ffmpeg_path = ffmpeg_path or _ffmpeg_manager.get_ffmpeg_path()
+        if not self.ffmpeg_path:
+            from src.common.logger import get_logger
+            logger = get_logger("video_splitter")
+            logger.warning("未找到ffmpeg，将使用系统默认路径")
+            self.ffmpeg_path = 'ffmpeg'
+        
+    def split_video(self, input_path: str, output_dir: str) -> List[str]:
+        """
+        将视频分割成3分钟长度的片段
+        
+        Args:
+            input_path: 输入视频路径
+            output_dir: 输出目录
+            
+        Returns:
+            分割后的视频文件路径列表
+        """
+        try:
+            import subprocess
+            import os
+            
+            from src.common.logger import get_logger
+            logger = get_logger("bilibili_handler")
+            
+            logger.debug(f"开始视频分割: 输入={input_path}, 输出目录={output_dir}, 分割间隔=3分钟")
+            logger.debug(f"FFmpeg路径: {self.ffmpeg_path}")
+            logger.debug(f"输入文件是否存在: {os.path.exists(input_path)}")
+            if os.path.exists(input_path):
+                input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+                logger.debug(f"输入文件大小: {input_size_mb:.2f}MB")
+            
+            # 确保输出目录存在
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 获取输入文件名（不含扩展名），处理中文文件名
+            base_name = os.path.splitext(os.path.basename(input_path))[0]
+            
+            # 为了避免Windows上的中文路径问题，使用英文标识符
+            # 构建输出文件模式，使用英文标识符避免编码问题
+            output_pattern = os.path.join(output_dir, f"part_%03d.mp4")
+            
+            # 每3分钟分割一次（180秒）
+            
+            # 构建FFmpeg命令 - 使用基于时间的分片（每3分钟）
+            cmd = [
+                self.ffmpeg_path,
+                '-i', input_path,
+                '-c', 'copy',  # 复制流，不重新编码
+                '-f', 'segment',
+                '-segment_time', '180',  # 每3分钟分割一次（180秒）
+                '-reset_timestamps', '1',  # 重置时间戳
+                '-segment_start_number', '0',  # 从0开始编号
+                '-avoid_negative_ts', 'make_zero',  # 避免负时间戳
+                '-y',  # 覆盖输出文件
+                output_pattern
+            ]
+            
+            # 执行分割命令
+            from src.common.logger import get_logger
+            logger = get_logger("bilibili_handler")
+            logger.debug(f"执行FFmpeg分割命令: {' '.join(cmd)}")
+            
+            # 使用正确的编码设置来避免Windows上的编码问题
+            # 添加环境变量设置，确保FFmpeg能正常工作
+            env = os.environ.copy()
+            env['FFREPORT'] = 'file=ffmpeg_debug.log:level=32'  # 启用FFmpeg调试日志
+            
+            result = subprocess.run(cmd, capture_output=True, text=False, env=env)
+            
+            logger.debug(f"FFmpeg分割返回码: {result.returncode}")
+            if result.stdout:
+                stdout_text = result.stdout.decode('utf-8', errors='replace').strip()
+                # 成功时标准输出通常为进度/信息
+                logger.debug(f"FFmpeg分割stdout: {stdout_text}")
+            if result.stderr:
+                stderr_text = result.stderr.decode('utf-8', errors='replace').strip()
+                # 注意：FFmpeg 常把普通信息写入 stderr。仅在失败(returncode!=0)时按错误记录
+                if result.returncode == 0:
+                    logger.debug(f"FFmpeg分割stderr: {stderr_text}")
+                else:
+                    logger.error(f"FFmpeg分割错误: {stderr_text}")
+            
+            if result.returncode != 0:
+                stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+                logger.error(f"视频分割失败: {stderr_text}")
+                # 尝试使用备用分片方法
+                logger.info("尝试使用备用分片方法...")
+                return self._fallback_split_video(input_path, output_dir)
+            
+            # 查找生成的分割文件，使用英文标识符
+            split_files = []
+            i = 0
+            max_attempts = 100  # 防止无限循环
+            
+            # 等待一下，确保文件系统同步
+            import time
+            time.sleep(1)
+            
+            while i < max_attempts:
+                part_path = os.path.join(output_dir, f"part_{i:03d}.mp4")
+                if os.path.exists(part_path):
+                    file_size = os.path.getsize(part_path)
+                    if file_size > 0:  # 确保文件不是空的
+                        split_files.append(part_path)
+                        logger.debug(f"找到分块文件: {part_path}, 大小: {file_size} 字节")
+                        i += 1
+                    else:
+                        logger.warning(f"分块文件大小为0，跳过: {part_path}")
+                        break
+                else:
+                    # 正常结束：下一个顺序分块不存在，停止扫描
+                    logger.debug(f"无更多分块，停止扫描。下一个期望: {part_path}")
+                    break
+            
+            if not split_files:
+                logger.warning("未找到任何分片文件")
+            
+            from src.common.logger import get_logger
+            logger = get_logger("bilibili_handler")
+            logger.info(f"视频分割完成，共生成{len(split_files)}个片段")
+            
+            return split_files
+            
+        except Exception as e:
+            from src.common.logger import get_logger
+            logger = get_logger("bilibili_handler")
+            logger.error(f"视频分割过程中发生错误: {e}")
+            return []
+    
+    def _fallback_split_video(self, input_path: str, output_dir: str) -> List[str]:
+        """备用视频分片方法，使用更简单的FFmpeg命令"""
+        try:
+            from src.common.logger import get_logger
+            logger = get_logger("bilibili_handler")
+            
+            logger.info("使用备用分片方法...")
+            
+            # 确保输出目录存在
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 使用更简单的分片命令（每3分钟）
+            output_pattern = os.path.join(output_dir, "part_%03d.mp4")
+            
+            cmd = [
+                self.ffmpeg_path,
+                '-i', input_path,
+                '-c', 'copy',
+                '-f', 'segment',
+                '-segment_time', '180',  # 每3分钟分割一次（180秒）
+                '-reset_timestamps', '1',
+                '-y',
+                output_pattern
+            ]
+            
+            logger.debug(f"备用分片命令: {' '.join(cmd)}")
+            
+            # 执行命令
+            result = subprocess.run(cmd, capture_output=True, text=False)
+            
+            if result.returncode != 0:
+                stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+                logger.error(f"备用分片也失败: {stderr_text}")
+                return []
+            
+            # 查找生成的文件
+            split_files = []
+            i = 0
+            while i < 100:  # 最多查找100个文件
+                part_path = os.path.join(output_dir, f"part_{i:03d}.mp4")
+                if os.path.exists(part_path) and os.path.getsize(part_path) > 0:
+                    split_files.append(part_path)
+                    logger.debug(f"备用方法找到分片: {part_path}")
+                    i += 1
+                else:
+                    break
+            
+            return split_files
+            
+        except Exception as e:
+            from src.common.logger import get_logger
+            logger = get_logger("bilibili_handler")
+            logger.error(f"备用分片方法也失败: {e}")
+            return []
 
 
 class BilibiliWbiSigner:
@@ -767,14 +1183,12 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         
         # 方法1：直接从message对象的stream_id属性获取
         if message.stream_id:
-            logger.info(f"方法1成功：直接从message.stream_id获取 - {message.stream_id}")
             return message.stream_id
             
         # 方法2：从chat_stream属性获取
         if hasattr(message, 'chat_stream') and message.chat_stream:
             stream_id = getattr(message.chat_stream, 'stream_id', None)
             if stream_id:
-                logger.info(f"方法2成功：从message.chat_stream.stream_id获取 - {stream_id}")
                 return stream_id
         
         # 方法3：从message_base_info中获取
@@ -794,7 +1208,6 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                         stream_id = chat_manager.get_stream_id(platform, user_id, False)
                     
                     if stream_id:
-                        logger.info(f"方法3成功：从message_base_info生成stream_id - {stream_id}")
                         return stream_id
             except Exception as e:
                 logger.error(f"方法3失败：{e}")
@@ -803,11 +1216,10 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         if message.additional_data:
             stream_id = message.additional_data.get("stream_id")
             if stream_id:
-                logger.info(f"方法4成功：从additional_data获取stream_id - {stream_id}")
                 return stream_id
         
         # 如果所有方法都失败，返回None
-        logger.error("所有获取stream_id的方法都失败了")
+        logger.error("无法获取stream_id")
         return None
 
     async def _send_text(self, content: str, stream_id: str) -> bool:
@@ -822,16 +1234,13 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         from src.common.logger import get_logger
         logger = get_logger("bilibili_handler")
         
-        logger.info(f"=== BilibiliAutoSendHandler.execute 开始 ===")
-        logger.info(f"消息类型: {type(message).__name__}")
-        logger.info(f"消息内容: {getattr(message, 'raw_message', '')[:100]}...")
+        logger.info("开始处理B站视频链接")
         
         if not self.get_config("plugin.enabled", True):
             logger.info("插件已禁用，退出处理")
             return True, True, None
 
         raw: str = getattr(message, "raw_message", "") or ""
-        logger.info(f"原始消息长度: {len(raw)}")
         
         url = BilibiliParser.find_first_bilibili_url(raw)
         if not url:
@@ -857,20 +1266,16 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 if message.message_base_info:
                     platform = message.message_base_info.get("platform")
                     user_id = message.message_base_info.get("user_id")
-                    logger.info(f"从message_base_info提取: platform={platform}, user_id={user_id}")
                 
                 # 从additional_data中提取
                 if not platform and not user_id and message.additional_data:
                     platform = message.additional_data.get("platform")
                     user_id = message.additional_data.get("user_id")
-                    logger.info(f"从additional_data提取: platform={platform}, user_id={user_id}")
                 
                 if platform and user_id:
-                    logger.info(f"备选方案：找到平台 {platform} 和用户ID {user_id}")
                     # 创建一个临时的stream_id
                     chat_manager = get_chat_manager()
                     stream_id = chat_manager.get_stream_id(platform, user_id, False)
-                    logger.info(f"备选方案：生成临时stream_id {stream_id}")
                 else:
                     logger.error("备选方案失败：无法获取平台和用户ID")
                     return True, True, "无法获取聊天流ID"
@@ -878,7 +1283,22 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 logger.error(f"备选方案失败：{e}")
                 return True, True, "无法获取聊天流ID"
         
-        logger.info(f"获取到stream_id: {stream_id}")
+
+
+        # 检查FFmpeg可用性
+        ffmpeg_info = _ffmpeg_manager.check_ffmpeg_availability()
+        show_ffmpeg_warnings = self.get_config("ffmpeg.show_warnings", True)
+
+        if not ffmpeg_info["ffmpeg_available"]:
+            if show_ffmpeg_warnings:
+                logger.warning("FFmpeg不可用，视频合并和分块功能将被禁用")
+            else:
+                logger.debug("FFmpeg不可用，视频合并和分块功能将被禁用")
+        if not ffmpeg_info["ffprobe_available"]:
+            if show_ffmpeg_warnings:
+                logger.warning("ffprobe不可用，视频时长检测将被禁用")
+            else:
+                logger.debug("ffprobe不可用，视频时长检测将被禁用")
 
         # 读取并记录配置
         config_opts = {
@@ -892,33 +1312,19 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             "try_look": self.get_config("bilibili.try_look", False),
             "sessdata": self.get_config("bilibili.sessdata", ""),
             "buvid3": self.get_config("bilibili.buvid3", ""),
+            "enable_video_splitting": self.get_config("bilibili.enable_video_splitting", True),
+            "delete_original_after_split": self.get_config("bilibili.delete_original_after_split", True),
         }
-        
-        logger.info(f"=== 配置信息 ===")
-        logger.info(f"WBI签名: {config_opts['use_wbi']}")
-        logger.info(f"偏好DASH: {config_opts['prefer_dash']}")
-        logger.info(f"格式标识: {config_opts['fnval']}")
-        logger.info(f"4K支持: {config_opts['fourk']}")
-        logger.info(f"清晰度: {config_opts['qn']}")
-        logger.info(f"平台: {config_opts['platform']}")
-        logger.info(f"高画质: {config_opts['high_quality']}")
-        logger.info(f"游客高画质: {config_opts['try_look']}")
-        logger.info(f"Cookie状态: SESSDATA={'已配置' if config_opts['sessdata'] else '未配置'}")
-        logger.info(f"Buvid3状态: {'已配置' if config_opts['buvid3'] else '未配置'}")
         
         # 检查鉴权配置
         if not config_opts['sessdata']:
             logger.warning("未配置SESSDATA，将使用游客模式")
             if config_opts['qn'] >= 64:
                 logger.warning(f"请求清晰度{config_opts['qn']}但未登录，可能失败")
-        else:
-            logger.info("已配置SESSDATA，可以使用登录功能")
-            
         if not config_opts['buvid3']:
             logger.warning("未配置Buvid3，session参数生成可能失败")
             
         # 执行配置验证
-        logger.info("执行配置验证...")
         validation_result = BilibiliParser.validate_config(config_opts)
         if not validation_result["valid"]:
             logger.error("配置验证失败，但继续尝试处理")
@@ -932,27 +1338,19 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         loop = asyncio.get_running_loop()
 
         def _blocking() -> Optional[Tuple[BilibiliVideoInfo, List[str], str]]:
-            logger.info("开始解析视频信息...")
             info = BilibiliParser.get_view_info_by_url(url)
             if not info:
                 logger.error("无法解析视频信息")
                 return None
                 
             logger.info(f"视频信息解析成功: {info.title}")
-            logger.info(f"视频ID: aid={info.aid}, cid={info.cid}, bvid={info.bvid}")
             
-            logger.info("开始获取播放地址...")
             urls, status = BilibiliParser.get_play_urls(info.aid, info.cid, config_opts)
             logger.info(f"播放地址获取结果: 状态={status}, URL数量={len(urls)}")
-            
-            if urls:
-                for i, play_url in enumerate(urls[:3]):  # 只记录前3个URL
-                    logger.info(f"播放地址{i+1}: {play_url[:100]}...")
                     
             return info, urls, status
 
         try:
-            logger.info("开始异步执行视频解析...")
             result = await loop.run_in_executor(None, _blocking)
         except Exception as exc:  # noqa: BLE001 - 简要兜底
             error_msg = f"解析失败：{exc}"
@@ -973,16 +1371,14 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             await self._send_text(error_msg, stream_id)
             return True, True, "解析失败"
 
-        logger.info(f"=== 解析结果 ===")
-        logger.info(f"视频标题: {info.title}")
-        logger.info(f"解析状态: {status}")
-        logger.info(f"播放地址数量: {len(urls)}")
+        logger.info(f"解析成功: {info.title}")
 
         # 发送解析结果（标题 + 直链）
         preview = "\n".join(urls[:3])  # 控制数量，避免过长
-        text = f"解析成功：\n标题：{info.title}\n直链：\n{preview}"
-        logger.info("发送解析结果文本...")
-        await self._send_text(text, stream_id)
+        await self._send_text("解析成功", stream_id)
+
+        # 下载前清理/准备分块目录
+        _prepare_split_dir()
 
         # 同时发送视频文件
         logger.info("开始下载视频文件...")
@@ -1017,21 +1413,27 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                         cookie_parts.append(f"buvid3={buvid3_hdr}")
                     headers["Cookie"] = "; ".join(cookie_parts)
                     headers["gaia_source"] = sessdata_hdr  # 添加 gaia_source
-                    logger.info(f"下载时添加Cookie: SESSDATA长度={len(sessdata_hdr)}")
-                    logger.info(f"下载时添加gaia_source: {sessdata_hdr[:10]}...")
+                    logger.info("下载时已添加Cookie认证")
                 else:
                     logger.warning("下载时未添加Cookie，可能遇到403错误")
                 
                 # 判断是否是分离的视频和音频流
                 # 注意：这里使用外层的urls变量，需要确保在正确的作用域中调用
                 if len(urls) >= 2 and (".m4s" in urls[0].lower() or ".m4s" in urls[1].lower()):
-                    logger.info("检测到分离的视频和音频流，尝试合并")
+                    logger.info("检测到分离的视频和音频流，开始下载并合并")
                     
                     # 下载视频流
                     video_temp = os.path.join(tmp_dir, f"{safe_title}_video.m4s")
-                    logger.info(f"开始下载视频流: {urls[0][:100]}...")
+
                     req = BilibiliParser._build_request(urls[0], headers)
                     with urllib.request.urlopen(req, timeout=60) as resp:
+                        # 获取文件总大小（如果可用）
+                        total_size = resp.headers.get('content-length')
+                        total_size = int(total_size) if total_size else 0
+                        
+                        # 创建进度条
+                        progress_bar = ProgressBar(total_size, "视频流下载进度", 30)
+                        
                         with open(video_temp, "wb") as f:
                             downloaded = 0
                             while True:
@@ -1040,18 +1442,28 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                                     break
                                 f.write(chunk)
                                 downloaded += len(chunk)
-                                if downloaded % (1024 * 1024) == 0:  # 每MB记录一次
-                                    logger.info(f"视频流下载进度: {downloaded // (1024 * 1024)}MB")
-                    logger.info(f"视频流下载完成: {video_temp}, 大小: {os.path.getsize(video_temp) // (1024 * 1024)}MB")
+                                # 使用进度条显示进度
+                                progress_bar.update(downloaded)
+                        
+                        # 完成进度条显示
+                        progress_bar.finish()
+                        logger.info(f"视频流下载完成，大小: {os.path.getsize(video_temp) // (1024 * 1024)}MB")
                     
                     # 下载音频流
                     audio_temp = os.path.join(tmp_dir, f"{safe_title}_audio.m4s")
                     
                     # 如果有音频URL，下载音频流
                     if len(urls) >= 2:
-                        logger.info(f"开始下载音频流: {urls[1][:100]}...")
+
                         req = BilibiliParser._build_request(urls[1], headers)
                         with urllib.request.urlopen(req, timeout=60) as resp:
+                            # 获取文件总大小（如果可用）
+                            total_size = resp.headers.get('content-length')
+                            total_size = int(total_size) if total_size else 0
+                            
+                            # 创建进度条
+                            progress_bar = ProgressBar(total_size, "音频流下载进度", 30)
+                            
                             with open(audio_temp, "wb") as f:
                                 downloaded = 0
                                 while True:
@@ -1060,9 +1472,12 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                                         break
                                     f.write(chunk)
                                     downloaded += len(chunk)
-                                    if downloaded % (1024 * 1024) == 0:  # 每MB记录一次
-                                        logger.info(f"音频流下载进度: {downloaded // (1024 * 1024)}MB")
-                        logger.info(f"音频流下载完成: {audio_temp}, 大小: {os.path.getsize(audio_temp) // (1024 * 1024)}MB")
+                                    # 使用进度条显示进度
+                                    progress_bar.update(downloaded)
+                            
+                            # 完成进度条显示
+                            progress_bar.finish()
+                            logger.info(f"音频流下载完成，大小: {os.path.getsize(audio_temp) // (1024 * 1024)}MB")
                     else:
                         logger.warning("没有音频流URL可用")
                         audio_temp = None
@@ -1071,58 +1486,39 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                     try:
                         import subprocess
                         import shutil
-                        
-                        logger.info("开始尝试合并视频和音频流...")
-                        
-                        # 检查FFmpeg/MP4Box 是否存在
-                        possible_paths = [
-                            os.path.join(os.environ.get('ProgramFiles', r'C:\\Program Files'), 'ffmpeg', 'bin', 'ffmpeg.exe'),
-                            os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\\Program Files (x86)'), 'ffmpeg', 'bin', 'ffmpeg.exe'),
-                            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ffmpeg.exe'),
-                            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'ffmpeg.exe'),
-                            os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'ffmpeg.exe'),
-                        ]
-                        ffmpeg_path = 'ffmpeg'
-                        if shutil.which('ffmpeg') is None:
-                            for path in possible_paths:
-                                if os.path.exists(path):
-                                    ffmpeg_path = path
-                                    logger.info(f"在路径 {path} 找到FFmpeg")
-                                    break
 
-                        # 尝试使用MP4Box合并（替代方案）
-                        mp4box_path = 'MP4Box'
-                        mp4box_available = shutil.which('MP4Box') is not None or any(
-                            os.path.exists(p.replace('ffmpeg.exe', 'MP4Box.exe')) for p in possible_paths
-                        )
-                        
-                        # 尝试使用FFmpeg
-                        if shutil.which('ffmpeg') is not None or os.path.exists(ffmpeg_path):
+                        # 使用跨平台FFmpeg管理器获取ffmpeg路径
+                        ffmpeg_path = _ffmpeg_manager.get_ffmpeg_path()
+                        if ffmpeg_path:
+                            logger.info(f"使用FFmpeg路径: {ffmpeg_path}")
                             # 首先检查视频文件格式
-                            logger.info("检查视频和音频文件格式")
+                            logger.info("检查文件格式...")
                             
-                            # 检查视频文件
-                            probe_cmd = [ffmpeg_path, '-v', 'error', '-show_entries', 'format=format_name', '-of', 'default=noprint_wrappers=1:nokey=1', video_temp]
-                            try:
-                                video_format = subprocess.run(probe_cmd, capture_output=True, text=False).stdout.decode('utf-8', errors='replace').strip()
-                                logger.info(f"视频文件格式: {video_format}")
-                            except Exception as e:
-                                logger.warning(f"无法检查视频格式: {str(e)}")
-                                video_format = "unknown"
-                                
-                            # 如果有音频文件，检查其格式
-                            audio_format = "none"
-                            if audio_temp and os.path.exists(audio_temp):
-                                probe_cmd = [ffmpeg_path, '-v', 'error', '-show_entries', 'format=format_name', '-of', 'default=noprint_wrappers=1:nokey=1', audio_temp]
+                            # 检查视频文件 - 使用跨平台ffprobe
+                            ffprobe_path = _ffmpeg_manager.get_ffprobe_path()
+                            if ffprobe_path:
+                                probe_cmd = [ffprobe_path, '-v', 'error', '-show_entries', 'format=format_name', '-of', 'default=noprint_wrappers=1:nokey=1', video_temp]
                                 try:
-                                    audio_format = subprocess.run(probe_cmd, capture_output=True, text=False).stdout.decode('utf-8', errors='replace').strip()
-                                    logger.info(f"音频文件格式: {audio_format}")
+                                    video_format = subprocess.run(probe_cmd, capture_output=True, text=False).stdout.decode('utf-8', errors='replace').strip()
                                 except Exception as e:
-                                    logger.warning(f"无法检查音频格式: {str(e)}")
+                                    logger.warning(f"无法检查视频格式: {str(e)}")
+                                    video_format = "unknown"
+                                    
+                                # 如果有音频文件，检查其格式
+                                audio_format = "none"
+                                if audio_temp and os.path.exists(audio_temp):
+                                    probe_cmd = [ffprobe_path, '-v', 'error', '-show_entries', 'format=format_name', '-of', 'default=noprint_wrappers=1:nokey=1', audio_temp]
+                                    try:
+                                        audio_format = subprocess.run(probe_cmd, capture_output=True, text=False).stdout.decode('utf-8', errors='replace').strip()
+                                    except Exception as e:
+                                        logger.warning(f"无法检查音频格式: {str(e)}")
+                            else:
+                                logger.warning(f"未找到ffprobe，无法检查文件格式: {ffprobe_path}")
+                                video_format = "unknown"
+                                audio_format = "none"
                             
                             # 根据文件格式决定处理方式
                             if 'm4s' in video_format.lower() or video_temp.lower().endswith('.m4s'):
-                                logger.info("检测到m4s格式，使用特殊处理")
                                 # 对于m4s格式，需要添加特殊参数
                                 if audio_temp and os.path.exists(audio_temp):
                                     ffmpeg_cmd = [
@@ -1163,31 +1559,20 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                                         '-y', temp_path
                                     ]
                             
-                            logger.info(f"执行FFmpeg命令: {' '.join(ffmpeg_cmd)}")
+                            logger.info("开始合并视频和音频...")
                             
+                            # 使用正确的编码设置来避免Windows上的编码问题
                             result = subprocess.run(ffmpeg_cmd, capture_output=True, text=False)
                             
                             if result.returncode == 0:
-                                logger.info("使用FFmpeg合并视频和音频成功")
-                                # 检查生成的文件是否包含音频流
-                                try:
-                                    probe_cmd = [ffmpeg_path, '-v', 'error', '-select_streams', 'a', '-show_streams', '-of', 'default=noprint_wrappers=1:nokey=1', temp_path]
-                                    has_audio = len(subprocess.run(probe_cmd, capture_output=True, text=False).stdout) > 0
-                                    if has_audio:
-                                        logger.info("生成的文件包含音频流")
-                                    else:
-                                        logger.warning("生成的文件不包含音频流，将尝试其他方法")
-                                except Exception as e:
-                                    logger.warning(f"无法检查生成文件的音频流: {str(e)}")
-                                
+                                logger.info("视频和音频合并成功")
                                 # 删除临时文件
                                 try:
                                     if os.path.exists(video_temp):
                                         os.remove(video_temp)
-                                        logger.info("删除临时视频文件")
                                     if audio_temp and os.path.exists(audio_temp):
                                         os.remove(audio_temp)
-                                        logger.info("删除临时音频文件")
+                                    logger.info("临时文件清理完成")
                                 except Exception as e:
                                     logger.warning(f"删除临时文件失败: {str(e)}")
                                     
@@ -1195,56 +1580,9 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                             else:
                                 stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
                                 logger.warning(f"FFmpeg合并失败: {stderr_text}")
-                        elif mp4box_available:
-                            # 尝试使用MP4Box合并
-                            logger.info("尝试使用MP4Box合并...")
-                            # 先将m4s重命名为mp4
-                            video_mp4 = video_temp.replace('.m4s', '.mp4')
-                            audio_mp4 = audio_temp.replace('.m4s', '.mp4')
-                            os.rename(video_temp, video_mp4)
-                            os.rename(audio_temp, audio_mp4)
-                            
-                            mp4box_cmd = [mp4box_path, '-add', video_mp4, '-add', audio_mp4, '-new', temp_path]
-                            logger.info(f"执行MP4Box命令: {' '.join(mp4box_cmd)}")
-                            
-                            result = subprocess.run(mp4box_cmd, capture_output=True, text=False)
-                            
-                            if result.returncode == 0:
-                                logger.info("使用MP4Box合并视频和音频成功")
-                                # 删除临时文件
-                                try:
-                                    os.remove(video_mp4)
-                                    os.remove(audio_mp4)
-                                    logger.info("删除临时MP4文件")
-                                except Exception:
-                                    pass
-                                return temp_path
-                            else:
-                                stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
-                                logger.warning(f"MP4Box合并失败: {stderr_text}")
                         else:
-                            logger.warning("未找到FFmpeg或MP4Box，无法合并视频和音频")
-                            
-                            # 尝试使用Python内置方法合并
-                            try:
-                                logger.info("尝试使用简单的文件连接方法合并")
-                                # 创建一个简单的容器文件
-                                with open(temp_path, 'wb') as outfile:
-                                    # 写入一个简单的MP4头
-                                    outfile.write(b'\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42mp41\x00\x00\x00\x00')
-                                    
-                                    # 写入视频数据
-                                    with open(video_temp, 'rb') as video_file:
-                                        outfile.write(video_file.read())
-                                    
-                                    # 写入音频数据
-                                    with open(audio_temp, 'rb') as audio_file:
-                                        outfile.write(audio_file.read())
-                                
-                                logger.info("简单合并完成，但可能不能正常播放")
-                                return temp_path
-                            except Exception as e:
-                                logger.warning(f"简单合并失败: {str(e)}")
+                            logger.warning("未找到FFmpeg，无法合并视频和音频")
+                            logger.info("将仅使用视频流文件")
                     except Exception as e:
                         logger.warning(f"合并失败: {str(e)}")
                     
@@ -1269,38 +1607,168 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         logger.info(f"视频下载完成: {temp_path}")
         caption = f"{info.title}"
 
-        async def _try_send(path: str) -> bool:
-            logger.info(f"尝试发送视频文件: {path}")
-            # 使用 send_api 发送视频或文件
-            try:
-                # 尝试发送视频
-                logger.info("尝试发送为视频类型...")
-                if await send_api.custom_to_stream("video", path, stream_id, display_message=caption):
-                    logger.info("视频发送成功")
-                    return True
-            except Exception as e:
-                logger.warning(f"视频发送失败: {e}")
+        # 检查视频时长，决定是否需要分块
+        video_duration = BilibiliParser.get_video_duration(temp_path)
+        logger.debug(f"检测到视频时长: {video_duration}秒")
+        
+        # 检查视频文件大小，决定是否需要分块
+        video_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+        logger.debug(f"检测到视频大小: {video_size_mb:.2f}MB")
+        
+        # 从配置读取分块设置
+        enable_splitting = self.get_config("bilibili.enable_video_splitting", True)
+        delete_original = self.get_config("bilibili.delete_original_after_split", True)
+        
+        # 固定按时间分割：每3分钟（180秒）分割一次
+        logger.debug(f"分块配置: enable_splitting={enable_splitting}, 模式=固定每3分钟分割, delete_original={delete_original}")
 
-            try:
-                # 尝试发送文件
-                logger.info("尝试发送为文件类型...")
-                if await send_api.custom_to_stream("file", path, stream_id, display_message=os.path.basename(path)):
-                    logger.info("文件发送成功")
-                    return True
-            except Exception as e:
-                logger.warning(f"文件发送失败: {e}")
+        # 检查FFmpeg是否可用，只有在可用时才执行分割
+        should_split = bool(enable_splitting) and ffmpeg_info["ffmpeg_available"]
+        if enable_splitting and not ffmpeg_info["ffmpeg_available"]:
+            logger.warning("分块开关已开启但FFmpeg不可用，将跳过分块处理")
 
-            return False
-
-        sent_ok = await _try_send(temp_path)
-        if not sent_ok:
-            logger.warning("所有发送方式都失败，发送提示信息")
-            await self._send_text("直链已发送，但宿主暂不支持直接发送视频文件。", stream_id)
-        else:
-            logger.info("视频文件发送成功")
+        logger.info(f"分块开关: {should_split}")
+        
+        if should_split:
+            logger.info("开始进行视频分割（每3分钟一段）")
             
-        logger.info("=== BilibiliAutoSendHandler.execute 完成 ===")
+            # 创建分块器 - 使用跨平台FFmpeg管理器
+            ffmpeg_info = _ffmpeg_manager.check_ffmpeg_availability()
+            logger.debug(f"FFmpeg可用性检查: {ffmpeg_info}")
+
+            if not ffmpeg_info["ffmpeg_available"]:
+                logger.error("系统中未找到FFmpeg，无法进行视频分片")
+                should_split = False
+            else:
+                # 使用FFmpeg管理器获取的路径
+                splitter = VideoSplitter(ffmpeg_info["ffmpeg_path"])
+                logger.debug(f"使用FFmpeg路径: {ffmpeg_info['ffmpeg_path']}")
+            
+            # 准备插件内的持久分块目录：插件目录/data/split
+            split_dir = _prepare_split_dir()
+
+            # 执行分块
+            split_files = splitter.split_video(temp_path, split_dir)
+            
+            if split_files:
+                logger.debug(f"视频分块完成，共{len(split_files)}个片段")
+                
+                # 发送分块后的视频片段
+                sent_count = 0
+                failed_files = []
+                for i, part_path in enumerate(split_files):
+                    part_caption = f"{caption} - 第{i+1}部分"
+                    
+                    if await self._send_video_part(part_path, part_caption, stream_id):
+                        sent_count += 1
+                        logger.debug(f"第{i+1}部分发送成功")
+                    else:
+                        logger.warning(f"第{i+1}部分发送失败")
+                        failed_files.append(part_path)
+                # 不删除分块文件与目录，保留给外部发送软件使用；将于下一次下载前清理
+                
+                # 根据配置决定是否删除原始下载文件
+                if delete_original:
+                    try:
+                        os.remove(temp_path)
+                        logger.info("已删除原始下载文件")
+                    except Exception as e:
+                        logger.warning(f"删除原始文件失败: {e}")
+                else:
+                    logger.debug("保留原始下载文件")
+                
+                logger.info(f"视频分块发送完成，成功发送{sent_count}/{len(split_files)}个片段")
+                return True, True, f"已发送直链与分块视频（{sent_count}个片段）"
+            else:
+                logger.warning("视频分块失败，将发送原始视频")
+                # 不在此处清理目录，保持一致性；下一次下载前会清理
+                should_split = False
+        
+        if not should_split:
+            # 发送原始视频（不分块）
+            async def _try_send(path: str) -> bool:
+                # 使用 send_api 发送视频或文件
+                try:
+                    # 尝试发送视频
+                    if await send_api.custom_to_stream("video", path, stream_id, display_message=caption):
+                        logger.info("视频发送成功")
+                        return True
+                except Exception as e:
+                    logger.warning(f"视频发送失败: {e}")
+
+                try:
+                    # 尝试发送文件
+                    if await send_api.custom_to_stream("file", path, stream_id, display_message=os.path.basename(path)):
+                        logger.info("文件发送成功")
+                        return True
+                except Exception as e:
+                    logger.warning(f"文件发送失败: {e}")
+
+                return False
+
+            sent_ok = await _try_send(temp_path)
+            if not sent_ok:
+                logger.warning("所有发送方式都失败，发送提示信息")
+                await self._send_text("直链已发送，但宿主暂不支持直接发送视频文件。", stream_id)
+            else:
+                logger.info("视频文件发送成功")
+            
+            # 删除临时文件
+            try:
+                os.remove(temp_path)
+            except Exception as e:
+                logger.warning(f"删除临时文件失败: {e}")
+            
+        logger.info("B站视频处理完成")
         return True, True, "已发送直链与视频（若宿主支持）"
+
+    async def _send_video_part(self, part_path: str, caption: str, stream_id: str) -> bool:
+        """发送视频分块片段"""
+        try:
+            # 检查文件是否存在
+            if not os.path.exists(part_path):
+                from src.common.logger import get_logger
+                logger = get_logger("bilibili_handler")
+                logger.error(f"视频分片文件不存在: {part_path}")
+                return False
+                
+            # 检查文件大小
+            file_size = os.path.getsize(part_path)
+            if file_size == 0:
+                from src.common.logger import get_logger
+                logger = get_logger("bilibili_handler")
+                logger.error(f"视频分片文件大小为0: {part_path}")
+                return False
+                
+            from src.common.logger import get_logger
+            logger = get_logger("bilibili_handler")
+            logger.debug(f"准备发送视频分片: {part_path}, 大小: {file_size} 字节")
+            
+            # 尝试发送视频
+            if await send_api.custom_to_stream("video", part_path, stream_id, display_message=caption):
+                logger.debug(f"视频分片发送成功: {part_path}")
+                return True
+        except Exception as e:
+            from src.common.logger import get_logger
+            logger = get_logger("bilibili_handler")
+            logger.warning(f"视频片段发送失败: {e}")
+
+        try:
+            # 尝试发送文件
+            if await send_api.custom_to_stream("file", part_path, stream_id, display_message=os.path.basename(part_path)):
+                from src.common.logger import get_logger
+                logger = get_logger("bilibili_handler")
+                logger.debug(f"文件分片发送成功: {part_path}")
+                return True
+        except Exception as e:
+            from src.common.logger import get_logger
+            logger = get_logger("bilibili_handler")
+            logger.warning(f"文件片段发送失败: {e}")
+
+        from src.common.logger import get_logger
+        logger = get_logger("bilibili_handler")
+        logger.error(f"所有发送方式都失败: {part_path}")
+        return False
 
 
 class BilibiliNoopAction(BaseAction):
@@ -1334,6 +1802,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
 
     config_section_descriptions = {
         "plugin": "插件基本信息",
+        "ffmpeg": "FFmpeg相关配置",
     }
 
     config_schema: Dict[str, Dict[str, ConfigField]] = {
@@ -1353,6 +1822,11 @@ class BilibiliVideoSenderPlugin(BasePlugin):
             "try_look": ConfigField(type=bool, default=False, description="是否启用游客高画质尝试模式（未登录时可能获取720P和1080P）"),
             "sessdata": ConfigField(type=str, default="", description="B站登录Cookie中的SESSDATA值（用于获取高清晰度视频）"),
             "buvid3": ConfigField(type=str, default="", description="B站设备标识Buvid3（用于生成session参数）"),
+            "enable_video_splitting": ConfigField(type=bool, default=True, description="是否启用视频分块功能（超过100MB的视频自动分割）"),
+            "delete_original_after_split": ConfigField(type=bool, default=True, description="是否在分块后删除原始文件"),
+        },
+        "ffmpeg": {
+            "show_warnings": ConfigField(type=bool, default=True, description="是否显示FFmpeg相关警告信息"),
         }
     }
 
