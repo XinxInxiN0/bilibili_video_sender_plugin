@@ -1,7 +1,10 @@
 # 麦麦B站视频自动解析插件使用说明
 
 发送B站视频链接到群里，麦麦会自动解析并发送视频。
-
+注意需要使用这个adapter
+**通过网盘分享的文件：MaiBot-Napcat-Adapter - 复制.zip
+链接: https://pan.baidu.com/s/1POlUqTvZRMk9iEg575gPWQ?pwd=eutb 提取码: eutb 
+--来自百度网盘超级会员v2的分享**
 ---
 
 ## 使用方法
