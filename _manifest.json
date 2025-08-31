@@ -4,12 +4,12 @@
   "version": "1.0.0",
   "description": "当收到包含哔哩哔哩视频链接的消息时，自动解析并发送可直连的播放地址与视频文件",
   "author": {
-    "name": "MaiBot开发团队",
-    "url": "https://github.com/MaiM-with-u"
+    "name": "XinxInxiN0",
+    "url": "https://github.com/XinxInxiN0"
   },
-  "license": "GPL-v3.0-or-later",
+  "license": "MIT",
   "host_application": {
-    "min_version": "0.8.0"
+    "min_version": "0.9.0"
   },
   "homepage_url": "https://github.com/MaiM-with-u/maibot",
   "repository_url": "https://github.com/MaiM-with-u/maibot",
@@ -28,4 +28,5 @@
       "支持b23.tv短链"
     ]
   }
+
 }
