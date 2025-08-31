@@ -57,6 +57,7 @@
 
 ## 使用效果
 <img width="1920" height="1020" alt="image" src="https://github.com/user-attachments/assets/220bc808-766d-4168-9936-afa83f0452a8" />
+现在不会附带直链了
 
 
 
