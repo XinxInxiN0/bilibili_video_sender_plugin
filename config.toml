@@ -33,4 +33,15 @@ sessdata = "填你自己的sessdata"
 
 # 可选：用于生成 session 的 buvid3（浏览器 Cookie 中可获得）
 buvid3 = "填你自己的buvid3"
+# 视频发送相关配置
+enable_video_splitting = true
+delete_original_after_split = true
+
+[ffmpeg]
+# FFmpeg相关配置
+show_warnings = true
+
+[wsl]
+# WSL路径转换配置
+enable_path_conversion = true
 

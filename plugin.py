@@ -15,6 +15,37 @@ import shutil
 
 from typing import Any, Dict, List, Optional, Tuple, Type
 
+
+
+
+def convert_windows_to_wsl_path(windows_path: str) -> str:
+    """将Windows路径转换为WSL路径
+    
+    例如：E:\path\to\file.mp4 -> /mnt/e/path/to/file.mp4
+    """
+    try:
+        # 尝试使用wslpath命令转换路径（从Windows调用WSL）
+        try:
+            # 在Windows上调用wsl wslpath命令
+            result = subprocess.run(['wsl', 'wslpath', '-u', windows_path], 
+                                   capture_output=True, text=True, check=True)
+            wsl_path = result.stdout.strip()
+            if wsl_path:
+                return wsl_path
+        except (subprocess.SubprocessError, FileNotFoundError):
+            pass
+            
+        # 如果wslpath命令失败，手动转换路径
+        # 移除盘符中的冒号，将反斜杠转换为正斜杠
+        if re.match(r'^[a-zA-Z]:', windows_path):
+            drive = windows_path[0].lower()
+            path = windows_path[2:].replace('\\', '/')
+            return f"/mnt/{drive}/{path}"
+        return windows_path
+    except Exception:
+        # 转换失败时返回原路径
+        return windows_path
+
 from src.plugin_system.base import (
     BaseAction,
     BaseCommand,
@@ -1170,11 +1201,11 @@ class BilibiliWbiSigner:
 
 
 class BilibiliAutoSendHandler(BaseEventHandler):
-    """收到包含哔哩哔哩视频链接的消息后，自动解析并发送直链与视频。"""
+    """收到包含哔哩哔哩视频链接的消息后，自动解析并发送视频。"""
 
     event_type = EventType.ON_MESSAGE
     handler_name = "bilibili_auto_send_handler"
-    handler_description = "解析B站视频链接并发送直链"
+    handler_description = "解析B站视频链接并发送视频"
 
     def _get_stream_id(self, message: MaiMessages) -> str | None:
         """从消息中获取stream_id"""
@@ -1373,8 +1404,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
         logger.info(f"解析成功: {info.title}")
 
-        # 发送解析结果（标题 + 直链）
-        preview = "\n".join(urls[:3])  # 控制数量，避免过长
+        # 发送解析成功消息
         await self._send_text("解析成功", stream_id)
 
         # 下载前清理/准备分块目录
@@ -1601,8 +1631,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
         temp_path = await asyncio.get_running_loop().run_in_executor(None, lambda: _download_to_temp(urls))
         if not temp_path:
-            logger.warning("视频下载失败，仅发送直链")
-            return True, True, "已发送直链，下载视频失败"
+            logger.warning("视频下载失败")
+            return True, True, "视频下载失败"
 
         logger.info(f"视频下载完成: {temp_path}")
         caption = f"{info.title}"
@@ -1678,7 +1708,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                     logger.debug("保留原始下载文件")
                 
                 logger.info(f"视频分块发送完成，成功发送{sent_count}/{len(split_files)}个片段")
-                return True, True, f"已发送直链与分块视频（{sent_count}个片段）"
+                return True, True, f"已发送分块视频（{sent_count}个片段）"
             else:
                 logger.warning("视频分块失败，将发送原始视频")
                 # 不在此处清理目录，保持一致性；下一次下载前会清理
@@ -1687,37 +1717,43 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         if not should_split:
             # 发送原始视频（不分块）
             async def _try_send(path: str) -> bool:
-                # 使用 send_api 发送视频或文件
+                # 优先尝试：将本地路径转换为 file:// URI，并以 videourl 形式发送视频
                 try:
-                    # 将视频文件转换为base64格式发送
+                    # 检查是否需要WSL路径转换
+                    enable_conversion = self.get_config("wsl.enable_path_conversion", True)
+                    actual_path = convert_windows_to_wsl_path(path) if enable_conversion else path
+                    file_uri = f"file://{actual_path}"
+                    
+                    logger.info(f"路径转换启用: {enable_conversion}")
+                    logger.info(f"原始路径: {path}")
+                    logger.info(f"转换后路径: {actual_path}")
+                    logger.info(f"发送URI: {file_uri}")
+                    
+                    if await send_api.custom_to_stream("videourl", file_uri, stream_id, display_message=caption):
+                        logger.info("视频(路径)发送成功")
+                        return True
+                except Exception as e:
+                    logger.warning(f"视频(路径)发送失败: {e}")
+
+                # 回退：使用base64作为视频数据发送
+                try:
                     import base64
                     with open(path, 'rb') as video_file:
                         video_data = video_file.read()
                         video_base64 = base64.b64encode(video_data).decode('utf-8')
-                    
                     logger.debug(f"视频文件已转换为base64，长度: {len(video_base64)} 字符")
-                    
-                    # 尝试发送视频
                     if await send_api.custom_to_stream("video", video_base64, stream_id, display_message=caption):
-                        logger.info("视频发送成功")
+                        logger.info("视频(baes64)发送成功")
                         return True
                 except Exception as e:
-                    logger.warning(f"视频发送失败: {e}")
-
-                try:
-                    # 尝试发送文件
-                    if await send_api.custom_to_stream("file", path, stream_id, display_message=os.path.basename(path)):
-                        logger.info("文件发送成功")
-                        return True
-                except Exception as e:
-                    logger.warning(f"文件发送失败: {e}")
+                    logger.warning(f"视频(baes64)发送失败: {e}")
 
                 return False
 
             sent_ok = await _try_send(temp_path)
             if not sent_ok:
                 logger.warning("所有发送方式都失败，发送提示信息")
-                await self._send_text("直链已发送，但宿主暂不支持直接发送视频文件。", stream_id)
+                await self._send_text("视频解析成功，但宿主暂不支持直接发送视频文件。", stream_id)
             else:
                 logger.info("视频文件发送成功")
             
@@ -1728,7 +1764,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 logger.warning(f"删除临时文件失败: {e}")
             
         logger.info("B站视频处理完成")
-        return True, True, "已发送直链与视频（若宿主支持）"
+        return True, True, "已发送视频（若宿主支持）"
 
     async def _send_video_part(self, part_path: str, caption: str, stream_id: str) -> bool:
         """发送视频分块片段"""
@@ -1751,39 +1787,42 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             from src.common.logger import get_logger
             logger = get_logger("bilibili_handler")
             logger.debug(f"准备发送视频分片: {part_path}, 大小: {file_size} 字节")
-            
-            # 将视频文件转换为base64格式发送
+
+            # 优先尝试：构造 file:// URI 并以 videourl 形式发送
+            try:
+                # 检查是否需要WSL路径转换
+                enable_conversion = self.get_config("wsl.enable_path_conversion", True)
+                actual_path = convert_windows_to_wsl_path(part_path) if enable_conversion else part_path
+                file_uri = f"file://{actual_path}"
+                
+                logger.info(f"路径转换启用: {enable_conversion}")
+                logger.info(f"原始路径: {part_path}")
+                logger.info(f"转换后路径: {actual_path}")
+                logger.info(f"发送URI: {file_uri}")
+                
+                if await send_api.custom_to_stream("videourl", file_uri, stream_id, display_message=caption):
+                    logger.debug(f"视频分片(路径)发送成功: {part_path}")
+                    return True
+            except Exception as e:
+                logger.warning(f"视频分片(路径)发送失败: {e}")
+
+            # 回退：转换为base64并以视频形式发送
             try:
                 import base64
                 with open(part_path, 'rb') as video_file:
                     video_data = video_file.read()
                     video_base64 = base64.b64encode(video_data).decode('utf-8')
-                
                 logger.debug(f"视频文件已转换为base64，长度: {len(video_base64)} 字符")
-                
-                # 使用base64格式发送视频
                 if await send_api.custom_to_stream("video", video_base64, stream_id, display_message=caption):
                     logger.debug(f"视频分片发送成功: {part_path}")
                     return True
             except Exception as e:
-                logger.warning(f"视频base64转换失败: {e}")
+                logger.warning(f"视频分片(base64)发送失败: {e}")
                 
         except Exception as e:
             from src.common.logger import get_logger
             logger = get_logger("bilibili_handler")
             logger.warning(f"视频片段发送失败: {e}")
-
-        try:
-            # 尝试发送文件
-            if await send_api.custom_to_stream("file", part_path, stream_id, display_message=os.path.basename(part_path)):
-                from src.common.logger import get_logger
-                logger = get_logger("bilibili_handler")
-                logger.debug(f"文件分片发送成功: {part_path}")
-                return True
-        except Exception as e:
-            from src.common.logger import get_logger
-            logger = get_logger("bilibili_handler")
-            logger.warning(f"文件片段发送失败: {e}")
 
         from src.common.logger import get_logger
         logger = get_logger("bilibili_handler")
@@ -1792,7 +1831,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
 @register_plugin
 class BilibiliVideoSenderPlugin(BasePlugin):
-    """B站视频直链解析与自动发送插件。"""
+    """B站视频解析与自动发送插件。"""
 
     plugin_name: str = "bilibili_video_sender_plugin"
     enable_plugin: bool = True
@@ -1807,8 +1846,6 @@ class BilibiliVideoSenderPlugin(BasePlugin):
 
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
-            "name": ConfigField(type=str, default="bilibili_video_sender_plugin", description="插件名称"),
-            "version": ConfigField(type=str, default="1.0.0", description="插件版本"),
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
         },
         "bilibili": {
@@ -1827,6 +1864,9 @@ class BilibiliVideoSenderPlugin(BasePlugin):
         },
         "ffmpeg": {
             "show_warnings": ConfigField(type=bool, default=True, description="是否显示FFmpeg相关警告信息"),
+        },
+        "wsl": {
+            "enable_path_conversion": ConfigField(type=bool, default=True, description="是否启用Windows到WSL的路径转换"),
         }
     }
 
