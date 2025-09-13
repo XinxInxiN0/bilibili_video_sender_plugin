@@ -1689,8 +1689,16 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             async def _try_send(path: str) -> bool:
                 # 使用 send_api 发送视频或文件
                 try:
+                    # 将视频文件转换为base64格式发送
+                    import base64
+                    with open(path, 'rb') as video_file:
+                        video_data = video_file.read()
+                        video_base64 = base64.b64encode(video_data).decode('utf-8')
+                    
+                    logger.debug(f"视频文件已转换为base64，长度: {len(video_base64)} 字符")
+                    
                     # 尝试发送视频
-                    if await send_api.custom_to_stream("video", path, stream_id, display_message=caption):
+                    if await send_api.custom_to_stream("video", video_base64, stream_id, display_message=caption):
                         logger.info("视频发送成功")
                         return True
                 except Exception as e:
@@ -1744,10 +1752,22 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             logger = get_logger("bilibili_handler")
             logger.debug(f"准备发送视频分片: {part_path}, 大小: {file_size} 字节")
             
-            # 尝试发送视频
-            if await send_api.custom_to_stream("video", part_path, stream_id, display_message=caption):
-                logger.debug(f"视频分片发送成功: {part_path}")
-                return True
+            # 将视频文件转换为base64格式发送
+            try:
+                import base64
+                with open(part_path, 'rb') as video_file:
+                    video_data = video_file.read()
+                    video_base64 = base64.b64encode(video_data).decode('utf-8')
+                
+                logger.debug(f"视频文件已转换为base64，长度: {len(video_base64)} 字符")
+                
+                # 使用base64格式发送视频
+                if await send_api.custom_to_stream("video", video_base64, stream_id, display_message=caption):
+                    logger.debug(f"视频分片发送成功: {part_path}")
+                    return True
+            except Exception as e:
+                logger.warning(f"视频base64转换失败: {e}")
+                
         except Exception as e:
             from src.common.logger import get_logger
             logger = get_logger("bilibili_handler")
@@ -1769,26 +1789,6 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         logger = get_logger("bilibili_handler")
         logger.error(f"所有发送方式都失败: {part_path}")
         return False
-
-
-class BilibiliNoopAction(BaseAction):
-    """占位Action，避免仅事件处理器导致的加载器不识别问题。"""
-
-    # 使用几乎不可能触发的关键字，确保不会影响实际行为
-    focus_activation_type = ActionActivationType.KEYWORD
-    normal_activation_type = ActionActivationType.KEYWORD
-
-    action_name = "bilibili_video_sender_noop"
-    action_description = "占位，不会实际触发"
-    activation_keywords = ["__never_triggers__"]
-    keyword_case_sensitive = False
-    action_parameters = {}
-    action_require = ["仅用于让插件被识别，不会被调用"]
-    associated_types = ["text"]
-
-    async def execute(self) -> Tuple[bool, str]:
-        return False, "noop"
-
 
 @register_plugin
 class BilibiliVideoSenderPlugin(BasePlugin):
@@ -1832,7 +1832,6 @@ class BilibiliVideoSenderPlugin(BasePlugin):
 
     def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
         return [
-            (BilibiliNoopAction.get_action_info(), BilibiliNoopAction),
             (BilibiliAutoSendHandler.get_handler_info(), BilibiliAutoSendHandler),
         ]
 
