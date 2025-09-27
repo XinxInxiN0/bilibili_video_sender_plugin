@@ -1,7 +1,6 @@
 # 麦麦B站视频自动解析插件使用说明
 
 发送B站视频链接到群里，麦麦会自动解析并发送视频。
-请更新到最新的adapter食用
 还有问题加qq3087033824
 觉得好用的话，可以点个star
 
@@ -13,7 +12,8 @@
 4. 解压 ffmpeg。
 5. 将解压后的 ffmpeg 文件夹放到 `bilibili_video_sender_plugin` 目录下。
 6. 打开 `config.toml`，填入 `sessdata` 和 `buvid3`（获取方法见下方）。
-7. 使用愉快 😊。
+7. 在napcat上新建一个正向http,并在config.toml内填入端口
+8. 使用愉快 😊。
 
 ---
 
@@ -46,14 +46,15 @@
   ![sessdata 和 buvid3](https://github.com/user-attachments/assets/607aa291-c927-4d00-8975-5e85fa0d1214)
 
 ---
+### napcat配置和config.toml
+<img width="645" height="749" alt="image" src="https://github.com/user-attachments/assets/223c491f-8433-4c47-923a-c4c830c9e572" />
+<img width="1186" height="807" alt="image" src="https://github.com/user-attachments/assets/10c79e45-048a-46c8-8d1d-ca7a4044070c" />
+两个端口要保持一致
+
 
 ## 完成后的文件夹结构示例
 <img width="412" height="131" alt="image" src="https://github.com/user-attachments/assets/63ef60df-99f3-4c79-b124-da566fd15cd0" />
 <img width="659" height="182" alt="image" src="https://github.com/user-attachments/assets/ddeb422f-b9fc-49b6-a652-866d06eb812c" />
-
-## 使用效果
-<img width="1920" height="1020" alt="image" src="https://github.com/user-attachments/assets/220bc808-766d-4168-9936-afa83f0452a8" />
-现在不会附带直链了
 
 
 
