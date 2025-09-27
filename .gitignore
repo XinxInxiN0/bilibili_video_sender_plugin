@@ -2,3 +2,4 @@ data/split
 __pycache__
 config.toml
 *.toml
+config.toml.backup
