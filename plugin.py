@@ -117,6 +117,107 @@ class FFmpegManager:
         logger.warning(f"未找到{executable_name}可执行文件")
         return None
 
+    def check_hardware_encoders(self) -> Dict[str, Any]:
+        """检测可用的硬件编码器"""
+        from src.common.logger import get_logger
+        logger = get_logger("ffmpeg_manager")
+        
+        ffmpeg_path = self.get_ffmpeg_path()
+        if not ffmpeg_path:
+            return {"available_encoders": [], "recommended_encoder": "libx264"}
+        
+        available_encoders = []
+        
+        # 定义要检测的硬件编码器列表（按优先级排序）
+        encoders_to_check = [
+            # NVIDIA GPU 编码器
+            {"name": "h264_nvenc", "type": "nvidia", "codec": "h264", "description": "NVIDIA H.264硬件编码"},
+            {"name": "hevc_nvenc", "type": "nvidia", "codec": "h265", "description": "NVIDIA H.265硬件编码"},
+            
+            # Intel Quick Sync Video
+            {"name": "h264_qsv", "type": "intel", "codec": "h264", "description": "Intel QSV H.264硬件编码"},
+            {"name": "hevc_qsv", "type": "intel", "codec": "h265", "description": "Intel QSV H.265硬件编码"},
+            
+            # AMD GPU 编码器
+            {"name": "h264_amf", "type": "amd", "codec": "h264", "description": "AMD H.264硬件编码"},
+            {"name": "hevc_amf", "type": "amd", "codec": "h265", "description": "AMD H.265硬件编码"},
+            
+            # Apple VideoToolbox (macOS)
+            {"name": "h264_videotoolbox", "type": "apple", "codec": "h264", "description": "Apple H.264硬件编码"},
+            {"name": "hevc_videotoolbox", "type": "apple", "codec": "h265", "description": "Apple H.265硬件编码"},
+        ]
+        
+        try:
+            # 获取所有可用的编码器
+            cmd = [ffmpeg_path, '-encoders']
+            process = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            
+            if process.returncode == 0:
+                encoders_output = process.stdout
+                
+                # 检查每个硬件编码器是否可用
+                for encoder in encoders_to_check:
+                    if encoder["name"] in encoders_output:
+                        # 进一步测试编码器是否真正可用
+                        if self._test_encoder(ffmpeg_path, encoder["name"]):
+                            available_encoders.append(encoder)
+                            logger.info(f"检测到可用的硬件编码器: {encoder['description']}")
+                        else:
+                            logger.debug(f"编码器 {encoder['name']} 存在但不可用")
+            else:
+                logger.warning(f"获取编码器列表失败: {process.stderr}")
+                
+        except Exception as e:
+            logger.warning(f"检测硬件编码器时发生错误: {e}")
+        
+        # 确定推荐的编码器
+        recommended_encoder = self._get_recommended_encoder(available_encoders)
+        
+        result = {
+            "available_encoders": available_encoders,
+            "recommended_encoder": recommended_encoder,
+            "total_hardware_encoders": len(available_encoders)
+        }
+        
+        logger.info(f"硬件编码器检测完成: 找到 {len(available_encoders)} 个可用编码器，推荐使用: {recommended_encoder}")
+        return result
+    
+    def _test_encoder(self, ffmpeg_path: str, encoder_name: str) -> bool:
+        """测试编码器是否真正可用"""
+        try:
+            # 创建一个1秒的测试视频来验证编码器
+            cmd = [
+                ffmpeg_path,
+                '-f', 'lavfi',
+                '-i', 'testsrc=duration=1:size=320x240:rate=1',
+                '-c:v', encoder_name,
+                '-t', '1',
+                '-f', 'null',
+                '-'
+            ]
+            
+            process = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            return process.returncode == 0
+            
+        except Exception:
+            return False
+    
+    def _get_recommended_encoder(self, available_encoders: List[Dict[str, Any]]) -> str:
+        """根据可用编码器选择推荐的编码器"""
+        if not available_encoders:
+            return "libx264"  # 默认软件编码器
+        
+        # 优先级排序：NVIDIA > Intel > AMD > Apple
+        priority_order = ["nvidia", "intel", "amd", "apple"]
+        
+        for encoder_type in priority_order:
+            for encoder in available_encoders:
+                if encoder["type"] == encoder_type and encoder["codec"] == "h264":
+                    return encoder["name"]
+        
+        # 如果没有H.264硬件编码器，返回第一个可用的
+        return available_encoders[0]["name"]
+
     def check_ffmpeg_availability(self) -> Dict[str, Any]:
         """检查FFmpeg可用性"""
         from src.common.logger import get_logger
@@ -128,7 +229,8 @@ class FFmpegManager:
             "ffmpeg_path": None,
             "ffprobe_path": None,
             "ffmpeg_version": None,
-            "system": self.system
+            "system": self.system,
+            "hardware_acceleration": {}
         }
 
         # 检查ffmpeg
@@ -145,6 +247,9 @@ class FFmpegManager:
                     version_line = process.stdout.split('\n')[0] if process.stdout else ""
                     result["ffmpeg_version"] = version_line
                     logger.info(f"FFmpeg版本: {version_line}")
+                    
+                    # 检测硬件编码器
+                    result["hardware_acceleration"] = self.check_hardware_encoders()
             except Exception as e:
                 logger.warning(f"获取FFmpeg版本失败: {e}")
 
@@ -947,15 +1052,65 @@ class BilibiliParser:
 
 
 class VideoCompressor:
-    """视频压缩处理类"""
+    """视频压缩处理类 - 支持自动硬件加速"""
     
-    def __init__(self, ffmpeg_path: Optional[str] = None):
+    def __init__(self, ffmpeg_path: Optional[str] = None, config: Optional[Dict] = None):
         self.ffmpeg_path = ffmpeg_path or _ffmpeg_manager.get_ffmpeg_path()
         if not self.ffmpeg_path:
             from src.common.logger import get_logger
             logger = get_logger("video_compressor")
             logger.warning("未找到ffmpeg，将使用系统默认路径")
             self.ffmpeg_path = 'ffmpeg'
+        
+        from src.common.logger import get_logger
+        logger = get_logger("video_compressor")
+        
+        # 读取配置
+        self.config = config or {}
+        enable_hardware = self.config.get("ffmpeg", {}).get("enable_hardware_acceleration", True)
+        force_encoder = self.config.get("ffmpeg", {}).get("force_encoder", "")
+        
+        if not enable_hardware:
+            # 禁用硬件加速
+            self.recommended_encoder = "libx264"
+            logger.info("硬件加速已禁用，使用软件编码: libx264")
+        elif force_encoder:
+            # 强制使用指定编码器
+            self.recommended_encoder = force_encoder
+            logger.info(f"强制使用指定编码器: {force_encoder}")
+        else:
+            # 自动检测硬件编码器
+            self.hardware_info = _ffmpeg_manager.check_hardware_encoders()
+            self.recommended_encoder = self._select_best_encoder()
+            
+            if self.recommended_encoder != "libx264":
+                available_count = self.hardware_info.get("total_hardware_encoders", 0)
+                logger.info(f"检测到 {available_count} 个硬件编码器，将使用: {self.recommended_encoder}")
+            else:
+                logger.info("未检测到可用硬件编码器，将使用软件编码: libx264")
+    
+    def _select_best_encoder(self) -> str:
+        """根据配置的优先级选择最佳编码器"""
+        available_encoders = self.hardware_info.get("available_encoders", [])
+        if not available_encoders:
+            return "libx264"
+        
+        # 获取优先级配置
+        priority_list = self.config.get("ffmpeg", {}).get("encoder_priority", ["nvidia", "intel", "amd", "apple"])
+        
+        # 按优先级查找可用的编码器
+        for encoder_type in priority_list:
+            for encoder in available_encoders:
+                if encoder["type"] == encoder_type and encoder["codec"] == "h264":
+                    return encoder["name"]
+        
+        # 如果按优先级没找到，返回第一个可用的H.264编码器
+        for encoder in available_encoders:
+            if encoder["codec"] == "h264":
+                return encoder["name"]
+        
+        # 最后回退到软件编码
+        return "libx264"
     
     def compress_video(self, input_path: str, output_path: str, target_size_mb: int = 100, quality: int = 23) -> bool:
         """
@@ -992,19 +1147,8 @@ class VideoCompressor:
                 logger.info(f"文件大小已符合要求，直接复制: {input_size_mb:.2f}MB")
                 return True
             
-            # 构建FFmpeg压缩命令
-            cmd = [
-                self.ffmpeg_path,
-                '-i', input_path,
-                '-c:v', 'libx264',          # 使用H.264编码器
-                '-crf', str(quality),       # 恒定质量模式
-                '-preset', 'medium',        # 编码预设（速度vs压缩率平衡）
-                '-c:a', 'aac',              # 音频编码器
-                '-b:a', '128k',             # 音频比特率
-                '-movflags', '+faststart',   # 优化流媒体播放
-                '-y',                       # 覆盖输出文件
-                output_path
-            ]
+            # 构建FFmpeg压缩命令 - 使用自动检测的编码器
+            cmd = self._build_compression_command(input_path, output_path, quality)
             
             logger.debug(f"执行FFmpeg压缩命令: {' '.join(cmd)}")
             
@@ -1038,6 +1182,91 @@ class VideoCompressor:
         except Exception as e:
             logger.error(f"视频压缩异常: {e}")
             return False
+    
+    def _build_compression_command(self, input_path: str, output_path: str, quality: int) -> List[str]:
+        """构建基于硬件加速的压缩命令"""
+        from src.common.logger import get_logger
+        logger = get_logger("video_compressor")
+        
+        # 基础命令
+        cmd = [self.ffmpeg_path, '-i', input_path]
+        
+        # 根据编码器类型添加不同的参数
+        if self.recommended_encoder == "libx264":
+            # 软件编码 H.264
+            cmd.extend([
+                '-c:v', 'libx264',
+                '-crf', str(quality),
+                '-preset', 'medium',
+                '-c:a', 'aac',
+                '-b:a', '128k'
+            ])
+            logger.debug("使用软件编码器 libx264")
+            
+        elif "nvenc" in self.recommended_encoder:
+            # NVIDIA 硬件编码
+            cmd.extend([
+                '-c:v', self.recommended_encoder,
+                '-cq', str(quality),  # 对于 nvenc 使用 -cq 而不是 -crf
+                '-preset', 'p4',      # NVENC 预设：p1(fastest) 到 p7(slowest)，p4是平衡
+                '-profile:v', 'high',
+                '-c:a', 'aac',
+                '-b:a', '128k'
+            ])
+            logger.debug(f"使用 NVIDIA 硬件编码器 {self.recommended_encoder}")
+            
+        elif "qsv" in self.recommended_encoder:
+            # Intel Quick Sync Video
+            cmd.extend([
+                '-c:v', self.recommended_encoder,
+                '-global_quality', str(quality),  # QSV 使用 global_quality
+                '-preset', 'medium',
+                '-c:a', 'aac',
+                '-b:a', '128k'
+            ])
+            logger.debug(f"使用 Intel QSV 硬件编码器 {self.recommended_encoder}")
+            
+        elif "amf" in self.recommended_encoder:
+            # AMD 硬件编码
+            cmd.extend([
+                '-c:v', self.recommended_encoder,
+                '-qp_i', str(quality),  # AMD AMF 使用 qp_i
+                '-qp_p', str(quality),
+                '-quality', 'balanced',
+                '-c:a', 'aac',
+                '-b:a', '128k'
+            ])
+            logger.debug(f"使用 AMD 硬件编码器 {self.recommended_encoder}")
+            
+        elif "videotoolbox" in self.recommended_encoder:
+            # Apple VideoToolbox
+            cmd.extend([
+                '-c:v', self.recommended_encoder,
+                '-q:v', str(quality),  # VideoToolbox 使用 -q:v
+                '-c:a', 'aac',
+                '-b:a', '128k'
+            ])
+            logger.debug(f"使用 Apple VideoToolbox 硬件编码器 {self.recommended_encoder}")
+            
+        else:
+            # 未知编码器，回退到软件编码
+            logger.warning(f"未知编码器 {self.recommended_encoder}，回退到软件编码")
+            cmd.extend([
+                '-c:v', 'libx264',
+                '-crf', str(quality),
+                '-preset', 'medium',
+                '-c:a', 'aac',
+                '-b:a', '128k'
+            ])
+        
+        # 通用参数
+        cmd.extend([
+            '-movflags', '+faststart',  # 优化流媒体播放
+            '-y',                       # 覆盖输出文件
+            output_path
+        ])
+        
+        return cmd
 
 
 class VideoSplitter:
@@ -1053,12 +1282,12 @@ class VideoSplitter:
         
     def split_video_by_size(self, input_path: str, output_dir: str, max_size_mb: int = 100) -> List[str]:
         """
-        根据文件大小智能分割视频
+        根据文件大小智能分割视频，优化分片大小接近目标大小
         
         Args:
             input_path: 输入视频路径
             output_dir: 输出目录
-            max_size_mb: 每个分片的最大大小（MB）
+            max_size_mb: 每个分片的目标大小（MB）
             
         Returns:
             分割后的视频文件路径列表
@@ -1072,7 +1301,7 @@ class VideoSplitter:
             
             # 获取视频信息
             input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
-            logger.info(f"开始智能分割视频: {input_path} ({input_size_mb:.2f}MB) -> 目标大小: {max_size_mb}MB")
+            logger.info(f"开始优化分割视频: {input_path} ({input_size_mb:.2f}MB) -> 目标大小: {max_size_mb}MB")
             
             # 获取视频时长
             duration = BilibiliParser.get_video_duration(input_path)
@@ -1080,40 +1309,54 @@ class VideoSplitter:
                 logger.error("无法获取视频时长，回退到固定时间分割")
                 return self.split_video(input_path, output_dir)
             
-            # 计算需要分割的段数
-            segments_needed = max(2, int(input_size_mb / max_size_mb) + 1)
-            segment_duration = duration / segments_needed
-            
-            logger.info(f"视频时长: {duration}秒, 预计分割为{segments_needed}段, 每段约{segment_duration:.1f}秒")
-            
             # 确保输出目录存在
             os.makedirs(output_dir, exist_ok=True)
+            
+            # 清理输出目录
+            for file in os.listdir(output_dir):
+                if file.startswith('part_') and file.endswith('.mp4'):
+                    os.remove(os.path.join(output_dir, file))
+            
+            # 计算初始分段数 - 更精确的算法
+            # 目标：让每个分片尽可能接近目标大小
+            optimal_segments = max(2, int(input_size_mb / max_size_mb))
+            
+            # 如果文件大小接近目标大小的整数倍，使用精确分段
+            if abs(input_size_mb - optimal_segments * max_size_mb) < max_size_mb * 0.1:
+                optimal_segments = int(input_size_mb / max_size_mb)
+            
+            segment_duration = duration / optimal_segments
+            
+            logger.info(f"视频时长: {duration}秒, 优化分割为{optimal_segments}段, 每段约{segment_duration:.1f}秒")
             
             # 构建输出文件模式
             output_pattern = os.path.join(output_dir, f"part_%03d.mp4")
             
-            # 构建FFmpeg命令 - 使用计算出的分段时间
+            # 构建FFmpeg命令
             cmd = [
                 self.ffmpeg_path,
                 '-i', input_path,
                 '-c', 'copy',  # 复制流，不重新编码
                 '-f', 'segment',
-                '-segment_time', str(int(segment_duration)),  # 使用计算出的分段时间
+                '-segment_time', str(segment_duration),  # 使用计算出的分段时间
                 '-reset_timestamps', '1',  # 重置时间戳
                 '-segment_start_number', '0',  # 从0开始编号
+                '-avoid_negative_ts', 'make_zero',  # 避免负时间戳
                 '-y',  # 覆盖现有文件
                 output_pattern
             ]
             
-            logger.debug(f"执行FFmpeg智能分割命令: {' '.join(cmd)}")
+            logger.debug(f"执行FFmpeg优化分割命令: {' '.join(cmd)}")
             
-            # 执行分割
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            # 执行分割 - 修复编码问题
+            result = subprocess.run(cmd, capture_output=True, text=False, timeout=1800)
             
             if result.returncode == 0:
-                # 查找生成的分片文件
+                # 查找生成的分片文件并分析大小
                 split_files = []
+                total_size = 0
                 i = 0
+                
                 while True:
                     part_path = os.path.join(output_dir, f"part_{i:03d}.mp4")
                     if os.path.exists(part_path):
@@ -1121,6 +1364,7 @@ class VideoSplitter:
                         if file_size > 0:
                             split_files.append(part_path)
                             file_size_mb = file_size / (1024 * 1024)
+                            total_size += file_size_mb
                             logger.debug(f"找到分片文件: {part_path}, 大小: {file_size_mb:.2f}MB")
                         else:
                             logger.warning(f"分片文件大小为0，跳过: {part_path}")
@@ -1129,20 +1373,198 @@ class VideoSplitter:
                         break
                 
                 if split_files:
-                    logger.info(f"智能分割成功，生成{len(split_files)}个分片")
+                    # 分析分片效果
+                    avg_size = total_size / len(split_files)
+                    oversized_count = sum(1 for f in split_files if os.path.getsize(f) / (1024 * 1024) > max_size_mb)
+                    
+                    logger.info(f"优化分割完成: 生成{len(split_files)}个分片")
+                    logger.info(f"分片大小统计: 平均{avg_size:.2f}MB, 超大分片{oversized_count}个")
+                    
+                    # 显示每个分片的详细信息
+                    for i, part_path in enumerate(split_files):
+                        part_size_mb = os.path.getsize(part_path) / (1024 * 1024)
+                        deviation = abs(part_size_mb - max_size_mb)
+                        logger.info(f"分片{i+1}: {part_size_mb:.2f}MB (偏差: {deviation:.2f}MB)")
+                    
                     return split_files
                 else:
-                    logger.error("智能分割完成但未找到分片文件")
+                    logger.error("优化分割完成但未找到分片文件")
                     return []
             else:
-                logger.error(f"智能分割失败，返回码: {result.returncode}")
+                logger.error(f"优化分割失败，返回码: {result.returncode}")
                 if result.stderr:
-                    logger.error(f"FFmpeg错误: {result.stderr}")
+                    stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+                    logger.error(f"FFmpeg错误: {stderr_text}")
                 return []
                 
         except Exception as e:
-            logger.error(f"智能分割异常: {e}")
+            logger.error(f"优化分割异常: {e}")
             return []
+    
+    def split_video_optimized(self, input_path: str, output_dir: str, target_size_mb: int = 100) -> List[str]:
+        """
+        使用迭代优化算法分割视频，使分片大小尽可能接近目标大小
+        
+        Args:
+            input_path: 输入视频路径
+            output_dir: 输出目录
+            target_size_mb: 每个分片的目标大小（MB）
+            
+        Returns:
+            分割后的视频文件路径列表
+        """
+        try:
+            import subprocess
+            import os
+            
+            from src.common.logger import get_logger
+            logger = get_logger("video_splitter")
+            
+            # 获取视频信息
+            input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+            logger.info(f"开始迭代优化分割: {input_path} ({input_size_mb:.2f}MB) -> 目标大小: {target_size_mb}MB")
+            
+            # 获取视频时长
+            duration = BilibiliParser.get_video_duration(input_path)
+            if not duration:
+                logger.error("无法获取视频时长，回退到普通分割")
+                return self.split_video_by_size(input_path, output_dir, target_size_mb)
+            
+            # 确保输出目录存在
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 清理输出目录
+            for file in os.listdir(output_dir):
+                if file.startswith('part_') and file.endswith('.mp4'):
+                    os.remove(os.path.join(output_dir, file))
+            
+            # 迭代优化算法
+            best_result = None
+            best_score = float('inf')
+            
+            # 尝试不同的分段数，找到最佳结果
+            min_segments = max(2, int(input_size_mb / target_size_mb))
+            max_segments = min(int(input_size_mb / (target_size_mb * 0.5)), int(duration / 30))  # 每段至少30秒
+            
+            logger.info(f"迭代范围: {min_segments} - {max_segments} 段")
+            
+            for segments in range(min_segments, max_segments + 1):
+                logger.debug(f"尝试 {segments} 段分割")
+                
+                # 清理之前的尝试
+                for file in os.listdir(output_dir):
+                    if file.startswith('part_') and file.endswith('.mp4'):
+                        os.remove(os.path.join(output_dir, file))
+                
+                segment_duration = duration / segments
+                
+                # 构建FFmpeg命令
+                output_pattern = os.path.join(output_dir, f"part_%03d.mp4")
+                cmd = [
+                    self.ffmpeg_path,
+                    '-i', input_path,
+                    '-c', 'copy',
+                    '-f', 'segment',
+                    '-segment_time', str(segment_duration),
+                    '-reset_timestamps', '1',
+                    '-segment_start_number', '0',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-y',
+                    output_pattern
+                ]
+                
+                # 执行分割 - 修复编码问题
+                result = subprocess.run(cmd, capture_output=True, text=False, timeout=900)
+                
+                if result.returncode == 0:
+                    # 分析分割结果
+                    split_files = []
+                    total_deviation = 0
+                    oversized_count = 0
+                    
+                    i = 0
+                    while True:
+                        part_path = os.path.join(output_dir, f"part_{i:03d}.mp4")
+                        if os.path.exists(part_path):
+                            file_size = os.path.getsize(part_path)
+                            if file_size > 0:
+                                split_files.append(part_path)
+                                file_size_mb = file_size / (1024 * 1024)
+                                deviation = abs(file_size_mb - target_size_mb)
+                                total_deviation += deviation
+                                if file_size_mb > target_size_mb:
+                                    oversized_count += 1
+                                logger.debug(f"找到分片: part_{i:03d}.mp4, 大小: {file_size_mb:.2f}MB")
+                            else:
+                                logger.debug(f"跳过空文件: part_{i:03d}.mp4")
+                            i += 1
+                        else:
+                            logger.debug(f"分片扫描结束，未找到: part_{i:03d}.mp4")
+                            break
+                    
+                    if split_files:
+                        # 计算评分：平均偏差 + 超大分片惩罚
+                        avg_deviation = total_deviation / len(split_files)
+                        score = avg_deviation + (oversized_count * 10)  # 超大分片严重惩罚
+                        
+                        logger.debug(f"{segments}段: 平均偏差{avg_deviation:.2f}MB, 超大{oversized_count}个, 评分{score:.2f}")
+                        
+                        if score < best_score:
+                            best_score = score
+                            # 深度复制文件列表，确保不会被后续清理影响
+                            best_result = []
+                            for split_file in split_files:
+                                # 为最佳结果创建副本文件
+                                best_file = split_file.replace('.mp4', f'_best.mp4')
+                                import shutil
+                                shutil.copy2(split_file, best_file)
+                                best_result.append(best_file)
+                            logger.debug(f"新的最佳结果: {segments}段, 评分{score:.2f}, 文件数{len(best_result)}")
+            
+            if best_result:
+                # 显示最佳结果
+                total_size = sum(os.path.getsize(f) for f in best_result) / (1024 * 1024)
+                avg_size = total_size / len(best_result)
+                oversized_count = sum(1 for f in best_result if os.path.getsize(f) / (1024 * 1024) > target_size_mb)
+                
+                logger.info(f"迭代优化完成: 生成{len(best_result)}个分片")
+                logger.info(f"分片大小统计: 平均{avg_size:.2f}MB, 超大分片{oversized_count}个, 最佳评分{best_score:.2f}")
+                
+                # 显示每个分片的详细信息
+                for i, part_path in enumerate(best_result):
+                    part_size_mb = os.path.getsize(part_path) / (1024 * 1024)
+                    deviation = abs(part_size_mb - target_size_mb)
+                    logger.info(f"分片{i+1}: {part_size_mb:.2f}MB (偏差: {deviation:.2f}MB)")
+                
+                # 清理临时文件（非最佳结果的文件）
+                for file in os.listdir(output_dir):
+                    if file.startswith('part_') and file.endswith('.mp4') and not file.endswith('_best.mp4'):
+                        try:
+                            os.remove(os.path.join(output_dir, file))
+                        except Exception as e:
+                            logger.debug(f"清理临时文件失败: {e}")
+                
+                # 重命名最佳结果文件为标准格式
+                final_result = []
+                for i, best_file in enumerate(best_result):
+                    final_file = os.path.join(output_dir, f"part_{i:03d}.mp4")
+                    try:
+                        if os.path.exists(final_file):
+                            os.remove(final_file)
+                        os.rename(best_file, final_file)
+                        final_result.append(final_file)
+                    except Exception as e:
+                        logger.warning(f"重命名最佳结果文件失败: {e}")
+                        final_result.append(best_file)
+                
+                return final_result
+            else:
+                logger.warning("迭代优化失败，回退到普通分割")
+                return self.split_video_by_size(input_path, output_dir, target_size_mb)
+                
+        except Exception as e:
+            logger.error(f"迭代优化分割异常: {e}")
+            return self.split_video_by_size(input_path, output_dir, target_size_mb)
     
     def split_video(self, input_path: str, output_dir: str) -> List[str]:
         """
@@ -1440,6 +1862,22 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         
         return None
 
+    def _get_group_id(self, message: MaiMessages) -> str | None:
+        """从消息中获取群ID"""
+        # 方法1：从message_base_info中获取
+        if message.message_base_info:
+            group_id = message.message_base_info.get("group_id")
+            if group_id and group_id != "" and group_id != "0":
+                return str(group_id)
+        
+        # 方法2：从additional_data中获取
+        if message.additional_data:
+            group_id = message.additional_data.get("group_id")
+            if group_id and group_id != "" and group_id != "0":
+                return str(group_id)
+        
+        return None
+
     def _get_stream_id(self, message: MaiMessages) -> str | None:
         """从消息中获取stream_id"""
         from src.common.logger import get_logger
@@ -1555,6 +1993,69 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             return False
         except Exception as e:
             logger.error(f"私聊视频发送异常: {e}")
+            return False
+
+    async def _send_group_video(self, original_path: str, converted_path: str, group_id: str) -> bool:
+        """通过API发送群视频
+        
+        Args:
+            original_path: 原始文件路径（用于文件检查）
+            converted_path: 转换后的路径（用于发送URI）
+            group_id: 目标群ID
+        """
+        from src.common.logger import get_logger
+        logger = get_logger("bilibili_handler")
+        
+        try:
+            # 获取配置的端口
+            port = self.get_config("api.port", 5700)
+            api_url = f"http://localhost:{port}/send_group_msg"
+            
+            # 检查文件是否存在（使用原始路径）
+            if not os.path.exists(original_path):
+                logger.error(f"视频文件不存在: {original_path}")
+                return False
+            
+            # 构造本地文件路径，使用file://协议（使用转换后路径）
+            file_uri = f"file://{converted_path}"
+            
+            logger.debug(f"群视频发送 - 原始路径: {original_path}")
+            logger.debug(f"群视频发送 - 转换后路径: {converted_path}")
+            logger.debug(f"群视频发送 - 发送URI: {file_uri}")
+            
+            # 构造请求数据
+            request_data = {
+                "group_id": group_id,
+                "message": [
+                    {
+                        "type": "video",
+                        "data": {
+                            "file": file_uri
+                        }
+                    }
+                ]
+            }
+            
+            logger.info(f"发送群视频API请求: {api_url}")
+            logger.info(f"请求数据: {request_data}")
+            
+            # 发送API请求
+            async with aiohttp.ClientSession() as session:
+                async with session.post(api_url, json=request_data, timeout=30) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        logger.info(f"群视频发送成功: {result}")
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"群视频发送失败: HTTP {response.status}, {error_text}")
+                        return False
+                        
+        except asyncio.TimeoutError:
+            logger.error("群视频发送超时")
+            return False
+        except Exception as e:
+            logger.error(f"群视频发送异常: {e}")
             return False
 
     async def execute(self, message: MaiMessages) -> Tuple[bool, bool, str | None]:
@@ -1950,11 +2451,11 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         
         logger.debug(f"视频处理配置: 分块={enable_splitting}, 压缩={enable_compression}, 最大大小={max_video_size_mb}MB, 压缩质量={compression_quality}")
         
-        # 新的处理策略：先分块后压缩
-        # 分块条件：启用分块 AND FFmpeg可用 AND (文件过大 OR 时长过长)
+        # 新的处理策略：仅基于文件大小分块
+        # 分块条件：启用分块 AND FFmpeg可用 AND 文件过大
         should_split = (bool(enable_splitting) and 
                        ffmpeg_info["ffmpeg_available"] and 
-                       (video_size_mb > max_video_size_mb or (video_duration and video_duration > 300)))  # 5分钟
+                       video_size_mb > max_video_size_mb)
         
         if enable_splitting and not ffmpeg_info["ffmpeg_available"]:
             logger.warning("分块开关已开启但FFmpeg不可用，将跳过分块处理")
@@ -1979,14 +2480,13 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             # 准备插件内的持久分块目录：插件目录/data/split
             split_dir = _prepare_split_dir()
 
-            # 第一步：进行分块（不考虑文件大小，优先按时间分割）
-            if video_duration and video_duration > 300:  # 5分钟
-                # 时长过长，使用固定时间分割
-                logger.info("使用基于时间的固定分割（每3分钟）")
-                split_files = splitter.split_video(temp_path, split_dir)
+            # 第一步：根据配置选择分割算法
+            use_optimized = self.get_config("bilibili.use_optimized_splitting", True)
+            if use_optimized:
+                logger.info("使用迭代优化分割算法，获得最接近目标大小的分片")
+                split_files = splitter.split_video_optimized(temp_path, split_dir, max_video_size_mb)
             else:
-                # 文件过大但时长不长，使用智能分割
-                logger.info("使用基于文件大小的智能分割")
+                logger.info("使用普通智能分割算法")
                 split_files = splitter.split_video_by_size(temp_path, split_dir, max_video_size_mb)
             
             if split_files:
@@ -1995,7 +2495,15 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 # 第二步：检查并压缩超大的分片
                 if enable_compression and ffmpeg_info["ffmpeg_available"]:
                     logger.info("开始检查分片并压缩超大文件...")
-                    compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"])
+                    # 构建配置字典传递给压缩器
+                    config_dict = {
+                        "ffmpeg": {
+                            "enable_hardware_acceleration": self.get_config("ffmpeg.enable_hardware_acceleration", True),
+                            "force_encoder": self.get_config("ffmpeg.force_encoder", ""),
+                            "encoder_priority": self.get_config("ffmpeg.encoder_priority", ["nvidia", "intel", "amd", "apple"])
+                        }
+                    }
+                    compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"], config_dict)
                     
                     final_split_files = []
                     compression_stats = {"compressed": 0, "skipped": 0, "failed": 0}
@@ -2037,44 +2545,74 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 else:
                     logger.debug("压缩功能已禁用或FFmpeg不可用，跳过分片压缩")
                 
-                # 在发送所有视频之前，统一进行WSL路径转换
+                # 重新扫描split目录，按顺序发送所有分片
+                logger.info("开始扫描split目录，按顺序发送所有分片")
+                
+                # 调试：显示split目录的实际内容
+                try:
+                    actual_files = os.listdir(split_dir)
+                    logger.info(f"split目录实际文件列表: {actual_files}")
+                    for file in actual_files:
+                        file_path = os.path.join(split_dir, file)
+                        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                        logger.info(f"  - {file}: {file_size_mb:.2f}MB")
+                except Exception as e:
+                    logger.warning(f"无法读取split目录内容: {e}")
+                
+                sent_count = 0
+                failed_files = []
+                
+                # 扫描split目录中的所有part_xxx.mp4文件（包括压缩后的文件）
+                all_split_files = []
+                i = 0
+                while True:
+                    # 优先查找压缩后的文件
+                    compressed_filename = f"part_{i:03d}_compressed.mp4"
+                    compressed_path = os.path.join(split_dir, compressed_filename)
+                    
+                    # 然后查找原始文件
+                    original_filename = f"part_{i:03d}.mp4"
+                    original_path = os.path.join(split_dir, original_filename)
+                    
+                    found_file = None
+                    found_filename = None
+                    
+                    # 优先使用压缩后的文件
+                    if os.path.exists(compressed_path) and os.path.getsize(compressed_path) > 0:
+                        found_file = compressed_path
+                        found_filename = compressed_filename
+                        logger.debug(f"找到压缩分片文件: {compressed_filename}")
+                    elif os.path.exists(original_path) and os.path.getsize(original_path) > 0:
+                        found_file = original_path
+                        found_filename = original_filename
+                        logger.debug(f"找到原始分片文件: {original_filename}")
+                    
+                    if found_file:
+                        all_split_files.append(found_file)
+                        part_size_mb = os.path.getsize(found_file) / (1024 * 1024)
+                        logger.debug(f"添加分片文件: {found_filename}, 大小: {part_size_mb:.2f}MB")
+                        i += 1
+                    else:
+                        logger.debug(f"分片扫描结束，未找到: {original_filename} 或 {compressed_filename}")
+                        break
+                
+                logger.info(f"共找到{len(all_split_files)}个分片文件，开始发送")
+                
+                # 为所有分片进行WSL路径转换
                 enable_conversion = self.get_config("wsl.enable_path_conversion", True)
                 if enable_conversion:
-                    logger.info("开始对所有视频分片进行WSL路径转换")
-                    converted_split_files = []
-                    for part_path in split_files:
+                    logger.info("开始对所有分片进行WSL路径转换")
+                    converted_all_split_files = []
+                    for part_path in all_split_files:
                         converted_path = convert_windows_to_wsl_path(part_path)
-                        converted_split_files.append(converted_path)
+                        converted_all_split_files.append(converted_path)
                         logger.debug(f"路径转换: {part_path} -> {converted_path}")
                 else:
                     logger.info("WSL路径转换已禁用，使用原始路径")
-                    converted_split_files = split_files
+                    converted_all_split_files = all_split_files
                 
-                # 最终检查所有分片的文件大小
-                logger.info("最终检查分片文件大小...")
-                oversized_parts = []
-                total_size = 0
-                for i, part_path in enumerate(split_files):
-                    part_size_mb = os.path.getsize(part_path) / (1024 * 1024)
-                    total_size += part_size_mb
-                    logger.debug(f"最终分片{i+1}大小: {part_size_mb:.2f}MB")
-                    if part_size_mb > max_video_size_mb:
-                        oversized_parts.append((i+1, part_size_mb))
-                
-                logger.info(f"分片处理完成: 共{len(split_files)}个分片, 总大小{total_size:.2f}MB")
-                
-                if oversized_parts:
-                    logger.warning(f"仍有{len(oversized_parts)}个超大分片:")
-                    for part_num, size_mb in oversized_parts:
-                        logger.warning(f"  分片{part_num}: {size_mb:.2f}MB (超过限制{max_video_size_mb}MB)")
-                    logger.warning("这些分片可能发送失败")
-                else:
-                    logger.info("所有分片文件大小符合要求")
-                
-                # 发送分块后的视频片段
-                sent_count = 0
-                failed_files = []
-                for i, (original_path, converted_path) in enumerate(zip(split_files, converted_split_files)):
+                # 按顺序发送所有分片
+                for i, (original_path, converted_path) in enumerate(zip(all_split_files, converted_all_split_files)):
                     part_caption = f"{caption} - 第{i+1}部分"
                     
                     if await self._send_video_part(original_path, converted_path, part_caption, stream_id, message):
@@ -2095,7 +2633,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 else:
                     logger.debug("保留原始下载文件")
                 
-                logger.info(f"视频分块发送完成，成功发送{sent_count}/{len(split_files)}个片段")
+                logger.info(f"视频分块发送完成，成功发送{sent_count}/{len(all_split_files)}个片段")
                 return True, True, f"已发送分块视频（{sent_count}个片段）"
             else:
                 logger.warning("视频分块失败，将发送原始视频")
@@ -2113,7 +2651,15 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 logger.info(f"单个视频文件大小({video_size_mb:.2f}MB)超过限制，开始压缩...")
                 
                 compressed_path = temp_path.replace('.mp4', '_compressed.mp4')
-                compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"])
+                # 构建配置字典传递给压缩器
+                config_dict = {
+                    "ffmpeg": {
+                        "enable_hardware_acceleration": self.get_config("ffmpeg.enable_hardware_acceleration", True),
+                        "force_encoder": self.get_config("ffmpeg.force_encoder", ""),
+                        "encoder_priority": self.get_config("ffmpeg.encoder_priority", ["nvidia", "intel", "amd", "apple"])
+                    }
+                }
+                compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"], config_dict)
                 
                 if compressor.compress_video(temp_path, compressed_path, max_video_size_mb, compression_quality):
                     compressed_size_mb = os.path.getsize(compressed_path) / (1024 * 1024)
@@ -2157,40 +2703,19 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                         logger.error("私聊消息但无法获取用户ID")
                         return False
                 else:
-                    # 群聊消息，使用原有逻辑
-                    logger.info("检测到群聊消息，使用原有发送逻辑")
-                    
-                    # 优先尝试：将本地路径转换为 file:// URI，并以 videourl 形式发送视频
-                    try:
-                        file_uri = f"file://{converted_path}"
-                        
-                        logger.info(f"发送URI: {file_uri}")
-                        
-                        if await send_api.custom_to_stream("videourl", file_uri, stream_id, display_message=caption):
-                            logger.info("视频(路径)发送成功")
-                            return True
-                    except Exception as e:
-                        logger.warning(f"视频(路径)发送失败: {e}")
-
-                    # 回退：使用base64作为视频数据发送
-                    try:
-                        import base64
-                        with open(path, 'rb') as video_file:
-                            video_data = video_file.read()
-                            video_base64 = base64.b64encode(video_data).decode('utf-8')
-                        logger.debug(f"视频文件已转换为base64，长度: {len(video_base64)} 字符")
-                        if await send_api.custom_to_stream("video", video_base64, stream_id, display_message=caption):
-                            logger.info("视频(baes64)发送成功")
-                            return True
-                    except Exception as e:
-                        logger.warning(f"视频(baes64)发送失败: {e}")
-
-                    return False
+                    # 群聊消息，使用群视频API
+                    group_id = self._get_group_id(message)
+                    if group_id:
+                        logger.info(f"检测到群聊消息，使用群视频API发送到群: {group_id}")
+                        return await self._send_group_video(path, converted_path, group_id)
+                    else:
+                        logger.error("检测到群聊消息但无法获取群ID，发送失败")
+                        return False
 
             sent_ok = await _try_send(final_video_path)
             if not sent_ok:
-                logger.warning("所有发送方式都失败，发送提示信息")
-                await self._send_text("视频解析成功，但宿主暂不支持直接发送视频文件。", stream_id)
+                logger.warning("视频发送失败")
+                await self._send_text("视频解析成功，但发送失败。请检查网络连接和API配置。", stream_id)
             else:
                 logger.info("视频文件发送成功")
             
@@ -2254,35 +2779,14 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                     logger.error("私聊消息但无法获取用户ID")
                     return False
             else:
-                # 群聊消息，使用原有逻辑
-                logger.info("分块视频检测到群聊消息，使用原有发送逻辑")
-                
-                # 优先尝试：构造 file:// URI 并以 videourl 形式发送（使用转换后路径）
-                try:
-                    file_uri = f"file://{converted_path}"
-                    
-                    logger.info(f"原始路径: {original_path}")
-                    logger.info(f"转换后路径: {converted_path}")
-                    logger.info(f"发送URI: {file_uri}")
-                    
-                    if await send_api.custom_to_stream("videourl", file_uri, stream_id, display_message=caption):
-                        logger.debug(f"视频分片(路径)发送成功: {original_path}")
-                        return True
-                except Exception as e:
-                    logger.warning(f"视频分片(路径)发送失败: {e}")
-
-                # 回退：转换为base64并以视频形式发送（使用原始路径）
-                try:
-                    import base64
-                    with open(original_path, 'rb') as video_file:
-                        video_data = video_file.read()
-                        video_base64 = base64.b64encode(video_data).decode('utf-8')
-                    logger.debug(f"视频文件已转换为base64，长度: {len(video_base64)} 字符")
-                    if await send_api.custom_to_stream("video", video_base64, stream_id, display_message=caption):
-                        logger.debug(f"视频分片发送成功: {original_path}")
-                        return True
-                except Exception as e:
-                    logger.warning(f"视频分片(base64)发送失败: {e}")
+                # 群聊消息，使用群视频API
+                group_id = self._get_group_id(message)
+                if group_id:
+                    logger.info(f"分块视频检测到群聊消息，使用群视频API发送到群: {group_id}")
+                    return await self._send_group_video(original_path, converted_path, group_id)
+                else:
+                    logger.error("分块视频检测到群聊消息但无法获取群ID，发送失败")
+                    return False
                 
         except Exception as e:
             from src.common.logger import get_logger
@@ -2329,6 +2833,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
             "max_video_size_mb": ConfigField(type=int, default=100, description="视频文件大小限制（MB），超过此大小将进行压缩或分割"),
             "enable_video_compression": ConfigField(type=bool, default=True, description="是否启用视频压缩功能"),
             "compression_quality": ConfigField(type=int, default=23, description="视频压缩质量 (1-51，数值越小质量越高，推荐18-28)"),
+            "use_optimized_splitting": ConfigField(type=bool, default=True, description="是否使用迭代优化分割算法（获得更接近目标大小的分片，但耗时较长）"),
         },
         "ffmpeg": {
             "show_warnings": ConfigField(type=bool, default=True, description="是否显示FFmpeg相关警告信息"),
