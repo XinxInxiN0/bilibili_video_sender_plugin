@@ -1,3 +1,4 @@
 data/split
 __pycache__
 config.toml
+*.toml
