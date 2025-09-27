@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 import subprocess
 import shutil
+import aiohttp
 
 from typing import Any, Dict, List, Optional, Tuple, Type
 
@@ -945,6 +946,100 @@ class BilibiliParser:
             return None
 
 
+class VideoCompressor:
+    """视频压缩处理类"""
+    
+    def __init__(self, ffmpeg_path: Optional[str] = None):
+        self.ffmpeg_path = ffmpeg_path or _ffmpeg_manager.get_ffmpeg_path()
+        if not self.ffmpeg_path:
+            from src.common.logger import get_logger
+            logger = get_logger("video_compressor")
+            logger.warning("未找到ffmpeg，将使用系统默认路径")
+            self.ffmpeg_path = 'ffmpeg'
+    
+    def compress_video(self, input_path: str, output_path: str, target_size_mb: int = 100, quality: int = 23) -> bool:
+        """
+        压缩视频到指定大小
+        
+        Args:
+            input_path: 输入视频路径
+            output_path: 输出视频路径
+            target_size_mb: 目标文件大小（MB）
+            quality: 压缩质量 (1-51，数值越小质量越高)
+            
+        Returns:
+            是否压缩成功
+        """
+        try:
+            import subprocess
+            import os
+            
+            from src.common.logger import get_logger
+            logger = get_logger("video_compressor")
+            
+            # 检查输入文件
+            if not os.path.exists(input_path):
+                logger.error(f"输入文件不存在: {input_path}")
+                return False
+            
+            input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+            logger.info(f"开始压缩视频: {input_path} ({input_size_mb:.2f}MB) -> 目标大小: {target_size_mb}MB")
+            
+            # 如果文件已经小于目标大小，直接复制
+            if input_size_mb <= target_size_mb:
+                import shutil
+                shutil.copy2(input_path, output_path)
+                logger.info(f"文件大小已符合要求，直接复制: {input_size_mb:.2f}MB")
+                return True
+            
+            # 构建FFmpeg压缩命令
+            cmd = [
+                self.ffmpeg_path,
+                '-i', input_path,
+                '-c:v', 'libx264',          # 使用H.264编码器
+                '-crf', str(quality),       # 恒定质量模式
+                '-preset', 'medium',        # 编码预设（速度vs压缩率平衡）
+                '-c:a', 'aac',              # 音频编码器
+                '-b:a', '128k',             # 音频比特率
+                '-movflags', '+faststart',   # 优化流媒体播放
+                '-y',                       # 覆盖输出文件
+                output_path
+            ]
+            
+            logger.debug(f"执行FFmpeg压缩命令: {' '.join(cmd)}")
+            
+            # 执行压缩
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)  # 30分钟超时
+            
+            if result.returncode == 0:
+                # 检查压缩后的文件大小
+                if os.path.exists(output_path):
+                    output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+                    logger.info(f"视频压缩成功: {input_size_mb:.2f}MB -> {output_size_mb:.2f}MB (压缩率: {(1-output_size_mb/input_size_mb)*100:.1f}%)")
+                    
+                    # 如果压缩后仍然过大，尝试更高的压缩率
+                    if output_size_mb > target_size_mb and quality < 35:
+                        logger.warning(f"压缩后文件仍然过大({output_size_mb:.2f}MB)，尝试更高压缩率")
+                        return self.compress_video(input_path, output_path, target_size_mb, quality + 5)
+                    
+                    return True
+                else:
+                    logger.error("压缩后文件不存在")
+                    return False
+            else:
+                logger.error(f"视频压缩失败，返回码: {result.returncode}")
+                if result.stderr:
+                    logger.error(f"FFmpeg错误信息: {result.stderr}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            logger.error("视频压缩超时")
+            return False
+        except Exception as e:
+            logger.error(f"视频压缩异常: {e}")
+            return False
+
+
 class VideoSplitter:
     """视频分块处理类"""
 
@@ -956,9 +1051,102 @@ class VideoSplitter:
             logger.warning("未找到ffmpeg，将使用系统默认路径")
             self.ffmpeg_path = 'ffmpeg'
         
+    def split_video_by_size(self, input_path: str, output_dir: str, max_size_mb: int = 100) -> List[str]:
+        """
+        根据文件大小智能分割视频
+        
+        Args:
+            input_path: 输入视频路径
+            output_dir: 输出目录
+            max_size_mb: 每个分片的最大大小（MB）
+            
+        Returns:
+            分割后的视频文件路径列表
+        """
+        try:
+            import subprocess
+            import os
+            
+            from src.common.logger import get_logger
+            logger = get_logger("video_splitter")
+            
+            # 获取视频信息
+            input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+            logger.info(f"开始智能分割视频: {input_path} ({input_size_mb:.2f}MB) -> 目标大小: {max_size_mb}MB")
+            
+            # 获取视频时长
+            duration = BilibiliParser.get_video_duration(input_path)
+            if not duration:
+                logger.error("无法获取视频时长，回退到固定时间分割")
+                return self.split_video(input_path, output_dir)
+            
+            # 计算需要分割的段数
+            segments_needed = max(2, int(input_size_mb / max_size_mb) + 1)
+            segment_duration = duration / segments_needed
+            
+            logger.info(f"视频时长: {duration}秒, 预计分割为{segments_needed}段, 每段约{segment_duration:.1f}秒")
+            
+            # 确保输出目录存在
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # 构建输出文件模式
+            output_pattern = os.path.join(output_dir, f"part_%03d.mp4")
+            
+            # 构建FFmpeg命令 - 使用计算出的分段时间
+            cmd = [
+                self.ffmpeg_path,
+                '-i', input_path,
+                '-c', 'copy',  # 复制流，不重新编码
+                '-f', 'segment',
+                '-segment_time', str(int(segment_duration)),  # 使用计算出的分段时间
+                '-reset_timestamps', '1',  # 重置时间戳
+                '-segment_start_number', '0',  # 从0开始编号
+                '-y',  # 覆盖现有文件
+                output_pattern
+            ]
+            
+            logger.debug(f"执行FFmpeg智能分割命令: {' '.join(cmd)}")
+            
+            # 执行分割
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            
+            if result.returncode == 0:
+                # 查找生成的分片文件
+                split_files = []
+                i = 0
+                while True:
+                    part_path = os.path.join(output_dir, f"part_{i:03d}.mp4")
+                    if os.path.exists(part_path):
+                        file_size = os.path.getsize(part_path)
+                        if file_size > 0:
+                            split_files.append(part_path)
+                            file_size_mb = file_size / (1024 * 1024)
+                            logger.debug(f"找到分片文件: {part_path}, 大小: {file_size_mb:.2f}MB")
+                        else:
+                            logger.warning(f"分片文件大小为0，跳过: {part_path}")
+                        i += 1
+                    else:
+                        break
+                
+                if split_files:
+                    logger.info(f"智能分割成功，生成{len(split_files)}个分片")
+                    return split_files
+                else:
+                    logger.error("智能分割完成但未找到分片文件")
+                    return []
+            else:
+                logger.error(f"智能分割失败，返回码: {result.returncode}")
+                if result.stderr:
+                    logger.error(f"FFmpeg错误: {result.stderr}")
+                return []
+                
+        except Exception as e:
+            logger.error(f"智能分割异常: {e}")
+            return []
+    
     def split_video(self, input_path: str, output_dir: str) -> List[str]:
         """
-        将视频分割成3分钟长度的片段
+        将视频分割成3分钟长度的片段（固定时间分割）
         
         Args:
             input_path: 输入视频路径
@@ -1207,6 +1395,51 @@ class BilibiliAutoSendHandler(BaseEventHandler):
     handler_name = "bilibili_auto_send_handler"
     handler_description = "解析B站视频链接并发送视频"
 
+    def _is_private_message(self, message: MaiMessages) -> bool:
+        """检测消息是否为私聊消息"""
+        from src.common.logger import get_logger
+        logger = get_logger("bilibili_handler")
+        
+        # 方法1：从message_base_info中获取group_id，如果没有group_id则为私聊
+        if message.message_base_info:
+            group_id = message.message_base_info.get("group_id")
+            if group_id is None or group_id == "" or group_id == "0":
+                logger.debug("检测到私聊消息（无group_id）")
+                return True
+            else:
+                logger.debug(f"检测到群聊消息（group_id: {group_id}）")
+                return False
+        
+        # 方法2：从additional_data中获取
+        if message.additional_data:
+            group_id = message.additional_data.get("group_id")
+            if group_id is None or group_id == "" or group_id == "0":
+                logger.debug("检测到私聊消息（additional_data无group_id）")
+                return True
+            else:
+                logger.debug(f"检测到群聊消息（additional_data group_id: {group_id}）")
+                return False
+        
+        # 默认当作群聊处理
+        logger.debug("无法确定消息类型，默认当作群聊处理")
+        return False
+    
+    def _get_user_id(self, message: MaiMessages) -> str | None:
+        """从消息中获取用户ID"""
+        # 方法1：从message_base_info中获取
+        if message.message_base_info:
+            user_id = message.message_base_info.get("user_id")
+            if user_id:
+                return str(user_id)
+        
+        # 方法2：从additional_data中获取
+        if message.additional_data:
+            user_id = message.additional_data.get("user_id")
+            if user_id:
+                return str(user_id)
+        
+        return None
+
     def _get_stream_id(self, message: MaiMessages) -> str | None:
         """从消息中获取stream_id"""
         from src.common.logger import get_logger
@@ -1259,6 +1492,69 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             return await send_api.text_to_stream(content, stream_id)
         except Exception as e:
             # 记录错误但不抛出异常，避免影响其他处理器
+            return False
+
+    async def _send_private_video(self, original_path: str, converted_path: str, user_id: str) -> bool:
+        """通过API发送私聊视频
+        
+        Args:
+            original_path: 原始文件路径（用于文件检查）
+            converted_path: 转换后的路径（用于发送URI）
+            user_id: 目标用户ID
+        """
+        from src.common.logger import get_logger
+        logger = get_logger("bilibili_handler")
+        
+        try:
+            # 获取配置的端口
+            port = self.get_config("api.port", 5700)
+            api_url = f"http://localhost:{port}/send_private_msg"
+            
+            # 检查文件是否存在（使用原始路径）
+            if not os.path.exists(original_path):
+                logger.error(f"视频文件不存在: {original_path}")
+                return False
+            
+            # 构造本地文件路径，使用file://协议（使用转换后路径）
+            file_uri = f"file://{converted_path}"
+            
+            logger.debug(f"私聊视频发送 - 原始路径: {original_path}")
+            logger.debug(f"私聊视频发送 - 转换后路径: {converted_path}")
+            logger.debug(f"私聊视频发送 - 发送URI: {file_uri}")
+            
+            # 构造请求数据
+            request_data = {
+                "user_id": user_id,
+                "message": [
+                    {
+                        "type": "video",
+                        "data": {
+                            "file": file_uri
+                        }
+                    }
+                ]
+            }
+            
+            logger.info(f"发送私聊视频API请求: {api_url}")
+            logger.info(f"请求数据: {request_data}")
+            
+            # 发送API请求
+            async with aiohttp.ClientSession() as session:
+                async with session.post(api_url, json=request_data, timeout=30) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        logger.info(f"私聊视频发送成功: {result}")
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"私聊视频发送失败: HTTP {response.status}, {error_text}")
+                        return False
+                        
+        except asyncio.TimeoutError:
+            logger.error("私聊视频发送超时")
+            return False
+        except Exception as e:
+            logger.error(f"私聊视频发送异常: {e}")
             return False
 
     async def execute(self, message: MaiMessages) -> Tuple[bool, bool, str | None]:
@@ -1641,26 +1937,32 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         video_duration = BilibiliParser.get_video_duration(temp_path)
         logger.debug(f"检测到视频时长: {video_duration}秒")
         
-        # 检查视频文件大小，决定是否需要分块
+        # 检查视频文件大小和时长，决定处理策略
         video_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
         logger.debug(f"检测到视频大小: {video_size_mb:.2f}MB")
         
-        # 从配置读取分块设置
+        # 从配置读取相关设置
         enable_splitting = self.get_config("bilibili.enable_video_splitting", True)
         delete_original = self.get_config("bilibili.delete_original_after_split", True)
+        max_video_size_mb = self.get_config("bilibili.max_video_size_mb", 100)
+        enable_compression = self.get_config("bilibili.enable_video_compression", True)
+        compression_quality = self.get_config("bilibili.compression_quality", 23)
         
-        # 固定按时间分割：每3分钟（180秒）分割一次
-        logger.debug(f"分块配置: enable_splitting={enable_splitting}, 模式=固定每3分钟分割, delete_original={delete_original}")
-
-        # 检查FFmpeg是否可用，只有在可用时才执行分割
-        should_split = bool(enable_splitting) and ffmpeg_info["ffmpeg_available"]
+        logger.debug(f"视频处理配置: 分块={enable_splitting}, 压缩={enable_compression}, 最大大小={max_video_size_mb}MB, 压缩质量={compression_quality}")
+        
+        # 新的处理策略：先分块后压缩
+        # 分块条件：启用分块 AND FFmpeg可用 AND (文件过大 OR 时长过长)
+        should_split = (bool(enable_splitting) and 
+                       ffmpeg_info["ffmpeg_available"] and 
+                       (video_size_mb > max_video_size_mb or (video_duration and video_duration > 300)))  # 5分钟
+        
         if enable_splitting and not ffmpeg_info["ffmpeg_available"]:
             logger.warning("分块开关已开启但FFmpeg不可用，将跳过分块处理")
 
-        logger.info(f"分块开关: {should_split}")
+        logger.info(f"处理策略: should_split={should_split} (文件大小={video_size_mb:.2f}MB, 时长={video_duration}秒)")
         
         if should_split:
-            logger.info("开始进行视频分割（每3分钟一段）")
+            logger.info("采用先分块后压缩的处理策略")
             
             # 创建分块器 - 使用跨平台FFmpeg管理器
             ffmpeg_info = _ffmpeg_manager.check_ffmpeg_availability()
@@ -1677,24 +1979,110 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             # 准备插件内的持久分块目录：插件目录/data/split
             split_dir = _prepare_split_dir()
 
-            # 执行分块
-            split_files = splitter.split_video(temp_path, split_dir)
+            # 第一步：进行分块（不考虑文件大小，优先按时间分割）
+            if video_duration and video_duration > 300:  # 5分钟
+                # 时长过长，使用固定时间分割
+                logger.info("使用基于时间的固定分割（每3分钟）")
+                split_files = splitter.split_video(temp_path, split_dir)
+            else:
+                # 文件过大但时长不长，使用智能分割
+                logger.info("使用基于文件大小的智能分割")
+                split_files = splitter.split_video_by_size(temp_path, split_dir, max_video_size_mb)
             
             if split_files:
                 logger.debug(f"视频分块完成，共{len(split_files)}个片段")
                 
+                # 第二步：检查并压缩超大的分片
+                if enable_compression and ffmpeg_info["ffmpeg_available"]:
+                    logger.info("开始检查分片并压缩超大文件...")
+                    compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"])
+                    
+                    final_split_files = []
+                    compression_stats = {"compressed": 0, "skipped": 0, "failed": 0}
+                    
+                    for i, part_path in enumerate(split_files):
+                        part_size_mb = os.path.getsize(part_path) / (1024 * 1024)
+                        logger.debug(f"检查分片{i+1}: {part_size_mb:.2f}MB")
+                        
+                        if part_size_mb > max_video_size_mb:
+                            # 需要压缩的分片
+                            logger.info(f"分片{i+1}大小({part_size_mb:.2f}MB)超过限制，开始压缩...")
+                            compressed_part_path = part_path.replace('.mp4', '_compressed.mp4')
+                            
+                            if compressor.compress_video(part_path, compressed_part_path, max_video_size_mb, compression_quality):
+                                compressed_size_mb = os.path.getsize(compressed_part_path) / (1024 * 1024)
+                                logger.info(f"分片{i+1}压缩成功: {part_size_mb:.2f}MB -> {compressed_size_mb:.2f}MB")
+                                final_split_files.append(compressed_part_path)
+                                compression_stats["compressed"] += 1
+                                
+                                # 删除原始分片（如果配置允许）
+                                if delete_original:
+                                    try:
+                                        os.remove(part_path)
+                                        logger.debug(f"已删除原始分片: {part_path}")
+                                    except Exception as e:
+                                        logger.warning(f"删除原始分片失败: {e}")
+                            else:
+                                logger.warning(f"分片{i+1}压缩失败，使用原始文件")
+                                final_split_files.append(part_path)
+                                compression_stats["failed"] += 1
+                        else:
+                            # 大小符合要求的分片
+                            logger.debug(f"分片{i+1}大小符合要求，无需压缩")
+                            final_split_files.append(part_path)
+                            compression_stats["skipped"] += 1
+                    
+                    logger.info(f"分片压缩完成: 压缩{compression_stats['compressed']}个, 跳过{compression_stats['skipped']}个, 失败{compression_stats['failed']}个")
+                    split_files = final_split_files
+                else:
+                    logger.debug("压缩功能已禁用或FFmpeg不可用，跳过分片压缩")
+                
+                # 在发送所有视频之前，统一进行WSL路径转换
+                enable_conversion = self.get_config("wsl.enable_path_conversion", True)
+                if enable_conversion:
+                    logger.info("开始对所有视频分片进行WSL路径转换")
+                    converted_split_files = []
+                    for part_path in split_files:
+                        converted_path = convert_windows_to_wsl_path(part_path)
+                        converted_split_files.append(converted_path)
+                        logger.debug(f"路径转换: {part_path} -> {converted_path}")
+                else:
+                    logger.info("WSL路径转换已禁用，使用原始路径")
+                    converted_split_files = split_files
+                
+                # 最终检查所有分片的文件大小
+                logger.info("最终检查分片文件大小...")
+                oversized_parts = []
+                total_size = 0
+                for i, part_path in enumerate(split_files):
+                    part_size_mb = os.path.getsize(part_path) / (1024 * 1024)
+                    total_size += part_size_mb
+                    logger.debug(f"最终分片{i+1}大小: {part_size_mb:.2f}MB")
+                    if part_size_mb > max_video_size_mb:
+                        oversized_parts.append((i+1, part_size_mb))
+                
+                logger.info(f"分片处理完成: 共{len(split_files)}个分片, 总大小{total_size:.2f}MB")
+                
+                if oversized_parts:
+                    logger.warning(f"仍有{len(oversized_parts)}个超大分片:")
+                    for part_num, size_mb in oversized_parts:
+                        logger.warning(f"  分片{part_num}: {size_mb:.2f}MB (超过限制{max_video_size_mb}MB)")
+                    logger.warning("这些分片可能发送失败")
+                else:
+                    logger.info("所有分片文件大小符合要求")
+                
                 # 发送分块后的视频片段
                 sent_count = 0
                 failed_files = []
-                for i, part_path in enumerate(split_files):
+                for i, (original_path, converted_path) in enumerate(zip(split_files, converted_split_files)):
                     part_caption = f"{caption} - 第{i+1}部分"
                     
-                    if await self._send_video_part(part_path, part_caption, stream_id):
+                    if await self._send_video_part(original_path, converted_path, part_caption, stream_id, message):
                         sent_count += 1
                         logger.debug(f"第{i+1}部分发送成功")
                     else:
                         logger.warning(f"第{i+1}部分发送失败")
-                        failed_files.append(part_path)
+                        failed_files.append(original_path)
                 # 不删除分块文件与目录，保留给外部发送软件使用；将于下一次下载前清理
                 
                 # 根据配置决定是否删除原始下载文件
@@ -1715,42 +2103,91 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 should_split = False
         
         if not should_split:
-            # 发送原始视频（不分块）
+            # 处理单个视频文件（不分块）
+            final_video_path = temp_path
+            
+            # 如果文件过大且启用压缩，先压缩
+            if (video_size_mb > max_video_size_mb and 
+                enable_compression and 
+                ffmpeg_info["ffmpeg_available"]):
+                logger.info(f"单个视频文件大小({video_size_mb:.2f}MB)超过限制，开始压缩...")
+                
+                compressed_path = temp_path.replace('.mp4', '_compressed.mp4')
+                compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"])
+                
+                if compressor.compress_video(temp_path, compressed_path, max_video_size_mb, compression_quality):
+                    compressed_size_mb = os.path.getsize(compressed_path) / (1024 * 1024)
+                    logger.info(f"单个视频压缩成功: {video_size_mb:.2f}MB -> {compressed_size_mb:.2f}MB")
+                    final_video_path = compressed_path
+                    
+                    # 删除原始文件（如果配置允许）
+                    if delete_original:
+                        try:
+                            os.remove(temp_path)
+                            logger.debug(f"已删除原始视频文件: {temp_path}")
+                        except Exception as e:
+                            logger.warning(f"删除原始视频文件失败: {e}")
+                else:
+                    logger.warning("单个视频压缩失败，使用原始文件")
+            elif video_size_mb > max_video_size_mb:
+                logger.warning(f"单个视频文件大小({video_size_mb:.2f}MB)超过限制但压缩功能不可用")
+            else:
+                logger.debug(f"单个视频文件大小({video_size_mb:.2f}MB)符合要求，无需压缩")
+            
+            # 发送处理后的视频文件
             async def _try_send(path: str) -> bool:
-                # 优先尝试：将本地路径转换为 file:// URI，并以 videourl 形式发送视频
-                try:
-                    # 检查是否需要WSL路径转换
-                    enable_conversion = self.get_config("wsl.enable_path_conversion", True)
-                    actual_path = convert_windows_to_wsl_path(path) if enable_conversion else path
-                    file_uri = f"file://{actual_path}"
+                # 在发送前进行WSL路径转换
+                enable_conversion = self.get_config("wsl.enable_path_conversion", True)
+                converted_path = convert_windows_to_wsl_path(path) if enable_conversion else path
+                
+                logger.debug(f"单视频发送 - 路径转换启用: {enable_conversion}")
+                logger.debug(f"单视频发送 - 原始路径: {path}")
+                logger.debug(f"单视频发送 - 转换后路径: {converted_path}")
+                
+                # 检查是否为私聊消息
+                is_private = self._is_private_message(message)
+                
+                if is_private:
+                    # 私聊消息，使用专用API发送
+                    user_id = self._get_user_id(message)
+                    if user_id:
+                        logger.info(f"检测到私聊消息，使用私聊视频API发送给用户: {user_id}")
+                        return await self._send_private_video(path, converted_path, user_id)
+                    else:
+                        logger.error("私聊消息但无法获取用户ID")
+                        return False
+                else:
+                    # 群聊消息，使用原有逻辑
+                    logger.info("检测到群聊消息，使用原有发送逻辑")
                     
-                    logger.info(f"路径转换启用: {enable_conversion}")
-                    logger.info(f"原始路径: {path}")
-                    logger.info(f"转换后路径: {actual_path}")
-                    logger.info(f"发送URI: {file_uri}")
-                    
-                    if await send_api.custom_to_stream("videourl", file_uri, stream_id, display_message=caption):
-                        logger.info("视频(路径)发送成功")
-                        return True
-                except Exception as e:
-                    logger.warning(f"视频(路径)发送失败: {e}")
+                    # 优先尝试：将本地路径转换为 file:// URI，并以 videourl 形式发送视频
+                    try:
+                        file_uri = f"file://{converted_path}"
+                        
+                        logger.info(f"发送URI: {file_uri}")
+                        
+                        if await send_api.custom_to_stream("videourl", file_uri, stream_id, display_message=caption):
+                            logger.info("视频(路径)发送成功")
+                            return True
+                    except Exception as e:
+                        logger.warning(f"视频(路径)发送失败: {e}")
 
-                # 回退：使用base64作为视频数据发送
-                try:
-                    import base64
-                    with open(path, 'rb') as video_file:
-                        video_data = video_file.read()
-                        video_base64 = base64.b64encode(video_data).decode('utf-8')
-                    logger.debug(f"视频文件已转换为base64，长度: {len(video_base64)} 字符")
-                    if await send_api.custom_to_stream("video", video_base64, stream_id, display_message=caption):
-                        logger.info("视频(baes64)发送成功")
-                        return True
-                except Exception as e:
-                    logger.warning(f"视频(baes64)发送失败: {e}")
+                    # 回退：使用base64作为视频数据发送
+                    try:
+                        import base64
+                        with open(path, 'rb') as video_file:
+                            video_data = video_file.read()
+                            video_base64 = base64.b64encode(video_data).decode('utf-8')
+                        logger.debug(f"视频文件已转换为base64，长度: {len(video_base64)} 字符")
+                        if await send_api.custom_to_stream("video", video_base64, stream_id, display_message=caption):
+                            logger.info("视频(baes64)发送成功")
+                            return True
+                    except Exception as e:
+                        logger.warning(f"视频(baes64)发送失败: {e}")
 
-                return False
+                    return False
 
-            sent_ok = await _try_send(temp_path)
+            sent_ok = await _try_send(final_video_path)
             if not sent_ok:
                 logger.warning("所有发送方式都失败，发送提示信息")
                 await self._send_text("视频解析成功，但宿主暂不支持直接发送视频文件。", stream_id)
@@ -1759,65 +2196,93 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             
             # 删除临时文件
             try:
-                os.remove(temp_path)
+                # 删除最终处理的文件
+                if os.path.exists(final_video_path):
+                    os.remove(final_video_path)
+                    logger.debug(f"已删除处理后的视频文件: {final_video_path}")
+                
+                # 如果还有原始文件且不同于最终文件，也删除
+                if final_video_path != temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+                    logger.debug(f"已删除原始视频文件: {temp_path}")
             except Exception as e:
                 logger.warning(f"删除临时文件失败: {e}")
             
         logger.info("B站视频处理完成")
         return True, True, "已发送视频（若宿主支持）"
 
-    async def _send_video_part(self, part_path: str, caption: str, stream_id: str) -> bool:
-        """发送视频分块片段"""
+    async def _send_video_part(self, original_path: str, converted_path: str, caption: str, stream_id: str, message: MaiMessages) -> bool:
+        """发送视频分块片段
+        
+        Args:
+            original_path: 原始文件路径（用于文件检查和base64读取）
+            converted_path: 转换后的路径（用于发送URI）
+            caption: 视频标题
+            stream_id: 流ID
+            message: 消息对象
+        """
         try:
-            # 检查文件是否存在
-            if not os.path.exists(part_path):
+            # 检查文件是否存在（使用原始路径）
+            if not os.path.exists(original_path):
                 from src.common.logger import get_logger
                 logger = get_logger("bilibili_handler")
-                logger.error(f"视频分片文件不存在: {part_path}")
+                logger.error(f"视频分片文件不存在: {original_path}")
                 return False
                 
-            # 检查文件大小
-            file_size = os.path.getsize(part_path)
+            # 检查文件大小（使用原始路径）
+            file_size = os.path.getsize(original_path)
             if file_size == 0:
                 from src.common.logger import get_logger
                 logger = get_logger("bilibili_handler")
-                logger.error(f"视频分片文件大小为0: {part_path}")
+                logger.error(f"视频分片文件大小为0: {original_path}")
                 return False
                 
             from src.common.logger import get_logger
             logger = get_logger("bilibili_handler")
-            logger.debug(f"准备发送视频分片: {part_path}, 大小: {file_size} 字节")
+            logger.debug(f"准备发送视频分片: {original_path} -> {converted_path}, 大小: {file_size} 字节")
 
-            # 优先尝试：构造 file:// URI 并以 videourl 形式发送
-            try:
-                # 检查是否需要WSL路径转换
-                enable_conversion = self.get_config("wsl.enable_path_conversion", True)
-                actual_path = convert_windows_to_wsl_path(part_path) if enable_conversion else part_path
-                file_uri = f"file://{actual_path}"
+            # 检查是否为私聊消息
+            is_private = self._is_private_message(message)
+            
+            if is_private:
+                # 私聊消息，使用专用API发送
+                user_id = self._get_user_id(message)
+                if user_id:
+                    logger.info(f"分块视频检测到私聊消息，使用私聊视频API发送给用户: {user_id}")
+                    return await self._send_private_video(original_path, converted_path, user_id)
+                else:
+                    logger.error("私聊消息但无法获取用户ID")
+                    return False
+            else:
+                # 群聊消息，使用原有逻辑
+                logger.info("分块视频检测到群聊消息，使用原有发送逻辑")
                 
-                logger.info(f"路径转换启用: {enable_conversion}")
-                logger.info(f"原始路径: {part_path}")
-                logger.info(f"转换后路径: {actual_path}")
-                logger.info(f"发送URI: {file_uri}")
-                
-                if await send_api.custom_to_stream("videourl", file_uri, stream_id, display_message=caption):
-                    logger.debug(f"视频分片(路径)发送成功: {part_path}")
-                    return True
-            except Exception as e:
-                logger.warning(f"视频分片(路径)发送失败: {e}")
+                # 优先尝试：构造 file:// URI 并以 videourl 形式发送（使用转换后路径）
+                try:
+                    file_uri = f"file://{converted_path}"
+                    
+                    logger.info(f"原始路径: {original_path}")
+                    logger.info(f"转换后路径: {converted_path}")
+                    logger.info(f"发送URI: {file_uri}")
+                    
+                    if await send_api.custom_to_stream("videourl", file_uri, stream_id, display_message=caption):
+                        logger.debug(f"视频分片(路径)发送成功: {original_path}")
+                        return True
+                except Exception as e:
+                    logger.warning(f"视频分片(路径)发送失败: {e}")
 
-            # 回退：转换为base64并以视频形式发送
-            try:
-                import base64
-                with open(part_path, 'rb') as video_file:
-                    video_data = video_file.read()
-                    video_base64 = base64.b64encode(video_data).decode('utf-8')
-                logger.debug(f"视频文件已转换为base64，长度: {len(video_base64)} 字符")
-                if await send_api.custom_to_stream("video", video_base64, stream_id, display_message=caption):
-                    logger.debug(f"视频分片发送成功: {part_path}")
-                    return True
-            except Exception as e:
-                logger.warning(f"视频分片(base64)发送失败: {e}")
+                # 回退：转换为base64并以视频形式发送（使用原始路径）
+                try:
+                    import base64
+                    with open(original_path, 'rb') as video_file:
+                        video_data = video_file.read()
+                        video_base64 = base64.b64encode(video_data).decode('utf-8')
+                    logger.debug(f"视频文件已转换为base64，长度: {len(video_base64)} 字符")
+                    if await send_api.custom_to_stream("video", video_base64, stream_id, display_message=caption):
+                        logger.debug(f"视频分片发送成功: {original_path}")
+                        return True
+                except Exception as e:
+                    logger.warning(f"视频分片(base64)发送失败: {e}")
                 
         except Exception as e:
             from src.common.logger import get_logger
@@ -1826,7 +2291,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
         from src.common.logger import get_logger
         logger = get_logger("bilibili_handler")
-        logger.error(f"所有发送方式都失败: {part_path}")
+        logger.error(f"所有发送方式都失败: {original_path}")
         return False
 
 @register_plugin
@@ -1859,14 +2324,20 @@ class BilibiliVideoSenderPlugin(BasePlugin):
             "try_look": ConfigField(type=bool, default=False, description="是否启用游客高画质尝试模式（未登录时可能获取720P和1080P）"),
             "sessdata": ConfigField(type=str, default="", description="B站登录Cookie中的SESSDATA值（用于获取高清晰度视频）"),
             "buvid3": ConfigField(type=str, default="", description="B站设备标识Buvid3（用于生成session参数）"),
-            "enable_video_splitting": ConfigField(type=bool, default=True, description="是否启用视频分块功能（超过100MB的视频自动分割）"),
+            "enable_video_splitting": ConfigField(type=bool, default=True, description="是否启用视频分块功能"),
             "delete_original_after_split": ConfigField(type=bool, default=True, description="是否在分块后删除原始文件"),
+            "max_video_size_mb": ConfigField(type=int, default=100, description="视频文件大小限制（MB），超过此大小将进行压缩或分割"),
+            "enable_video_compression": ConfigField(type=bool, default=True, description="是否启用视频压缩功能"),
+            "compression_quality": ConfigField(type=int, default=23, description="视频压缩质量 (1-51，数值越小质量越高，推荐18-28)"),
         },
         "ffmpeg": {
             "show_warnings": ConfigField(type=bool, default=True, description="是否显示FFmpeg相关警告信息"),
         },
         "wsl": {
             "enable_path_conversion": ConfigField(type=bool, default=True, description="是否启用Windows到WSL的路径转换"),
+        },
+        "api": {
+            "port": ConfigField(type=int, default=5700, description="API服务端口号"),
         }
     }
 

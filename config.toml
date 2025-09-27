@@ -14,7 +14,7 @@ prefer_dash = true
 fnval = 4048
 
 # 允许 4K。与 fnval 的 128 位叠加
-fourk = true
+fourk = false
 
 # 期望清晰度 qn（DASH 下无效，留 0；MP4 时可设 16/32/64/80/112 等）
 qn = 0
@@ -36,6 +36,12 @@ buvid3 = "填你自己的buvid3"
 # 视频发送相关配置
 enable_video_splitting = true
 delete_original_after_split = true
+# 视频文件大小限制（MB），超过此大小将进行压缩或分割
+max_video_size_mb = 100
+# 是否启用视频压缩功能
+enable_video_compression = true
+# 压缩质量 (1-51，数值越小质量越高，推荐18-28)
+compression_quality = 28
 
 [ffmpeg]
 # FFmpeg相关配置
@@ -44,4 +50,8 @@ show_warnings = true
 [wsl]
 # WSL路径转换配置
 enable_path_conversion = true
+
+[api]
+# API服务配置
+port = 5700
 
