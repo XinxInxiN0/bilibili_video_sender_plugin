@@ -1818,6 +1818,33 @@ class BilibiliAutoSendHandler(BaseEventHandler):
     handler_name = "bilibili_auto_send_handler"
     handler_description = "解析B站视频链接并发送视频"
 
+    def _should_return_5_tuple(self) -> bool:
+        """判断是否应该返回5元组（基于events_manager版本）
+        
+        Returns:
+            bool: True表示返回5元组，False表示返回3元组
+        """
+        # 默认为 False（旧版本），向后兼容
+        return self.get_config("use_new_events_manager", False)
+    
+    def _make_return_value(self, success: bool, continue_processing: bool, result: str | None) -> Tuple:
+        """根据版本配置生成返回值
+        
+        Args:
+            success: 执行是否成功
+            continue_processing: 是否继续处理后续事件
+            result: 执行结果描述
+            
+        Returns:
+            Tuple: 根据配置返回3元组或5元组
+        """
+        if self._should_return_5_tuple():
+            # 新版本：返回5元组 (success, continue_processing, result, modified_message, metadata)
+            return success, continue_processing, result, None, None
+        else:
+            # 旧版本：返回3元组 (success, continue_processing, result)
+            return success, continue_processing, result
+
     def _is_private_message(self, message: MaiMessages) -> bool:
         """检测消息是否为私聊消息"""
         from src.common.logger import get_logger
@@ -2067,14 +2094,14 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         
         if not self.get_config("plugin.enabled", True):
             logger.info("插件已禁用，退出处理")
-            return True, True, None
+            return self._make_return_value(True, True, None)
 
         raw: str = getattr(message, "raw_message", "") or ""
         
         url = BilibiliParser.find_first_bilibili_url(raw)
         if not url:
             logger.info("未找到B站链接，退出处理")
-            return True, True, None
+            return self._make_return_value(True, True, None)
         
         logger.info(f"找到B站链接: {url}")
 
@@ -2107,10 +2134,10 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                     stream_id = chat_manager.get_stream_id(platform, user_id, False)
                 else:
                     logger.error("备选方案失败：无法获取平台和用户ID")
-                    return True, True, "无法获取聊天流ID"
+                    return self._make_return_value(True, True, "无法获取聊天流ID")
             except Exception as e:
                 logger.error(f"备选方案失败：{e}")
-                return True, True, "无法获取聊天流ID"
+                return self._make_return_value(True, True, "无法获取聊天流ID")
         
 
 
@@ -2185,20 +2212,20 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             error_msg = f"解析失败：{exc}"
             logger.error(error_msg)
             await self._send_text(error_msg, stream_id)
-            return True, True, "解析失败"
+            return self._make_return_value(True, True, "解析失败")
 
         if not result:
             error_msg = "未能解析该视频链接，请稍后重试。"
             logger.error(error_msg)
             await self._send_text(error_msg, stream_id)
-            return True, True, "解析失败"
+            return self._make_return_value(True, True, "解析失败")
 
         info, urls, status = result
         if not urls:
             error_msg = f"解析失败：{status}"
             logger.error(error_msg)
             await self._send_text(error_msg, stream_id)
-            return True, True, "解析失败"
+            return self._make_return_value(True, True, "解析失败")
 
         logger.info(f"解析成功: {info.title}")
 
@@ -2430,7 +2457,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         temp_path = await asyncio.get_running_loop().run_in_executor(None, lambda: _download_to_temp(urls))
         if not temp_path:
             logger.warning("视频下载失败")
-            return True, True, "视频下载失败"
+            return self._make_return_value(True, True, "视频下载失败")
 
         logger.info(f"视频下载完成: {temp_path}")
         caption = f"{info.title}"
@@ -2635,7 +2662,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                     logger.debug("保留原始下载文件")
                 
                 logger.info(f"视频分块发送完成，成功发送{sent_count}/{len(all_split_files)}个片段")
-                return True, True, f"已发送分块视频（{sent_count}个片段）"
+                return self._make_return_value(True, True, f"已发送分块视频（{sent_count}个片段）")
             else:
                 logger.warning("视频分块失败，将发送原始视频")
                 # 不在此处清理目录，保持一致性；下一次下载前会清理
@@ -2735,7 +2762,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 logger.warning(f"删除临时文件失败: {e}")
             
         logger.info("B站视频处理完成")
-        return True, True, "已发送视频（若宿主支持）"
+        return self._make_return_value(True, True, "已发送视频（若宿主支持）")
 
     async def _send_video_part(self, original_path: str, converted_path: str, caption: str, stream_id: str, message: MaiMessages) -> bool:
         """发送视频分块片段
@@ -2817,6 +2844,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
+            "use_new_events_manager": ConfigField(type=bool, default=False, description="是否使用新版events_manager（0.10.2及以上版本设为true，否则设为false）"),
         },
         "bilibili": {
             "use_wbi": ConfigField(type=bool, default=True, description="是否使用WBI签名（推荐开启）"),
@@ -2838,6 +2866,9 @@ class BilibiliVideoSenderPlugin(BasePlugin):
         },
         "ffmpeg": {
             "show_warnings": ConfigField(type=bool, default=True, description="是否显示FFmpeg相关警告信息"),
+            "enable_hardware_acceleration": ConfigField(type=bool, default=True, description="是否启用硬件加速自动检测（推荐开启，可大幅提升视频压缩速度）"),
+            "force_encoder": ConfigField(type=str, default="", description="强制使用特定编码器（留空则自动选择，可选值：libx264/h264_nvenc/h264_qsv/h264_amf/h264_videotoolbox）"),
+            "encoder_priority": ConfigField(type=list, default=["nvidia", "intel", "amd", "apple"], description="编码器优先级（当检测到多个硬件编码器时的选择顺序）"),
         },
         "wsl": {
             "enable_path_conversion": ConfigField(type=bool, default=True, description="是否启用Windows到WSL的路径转换"),

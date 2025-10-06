@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "麦麦发B站视频",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "让麦麦解析b站视频链接并发送，群聊私聊都可用",
   "author": {
     "name": "XinxInxiN0",
@@ -10,7 +10,7 @@
   "license": "MIT",
   "host_application": {
     "min_version": "0.9.0",
-    "man_version": "0.10.0"
+    "man_version": "0.10.3"
   },
   "homepage_url": "https://github.com/MaiM-with-u/maibot",
   "repository_url": "https://github.com/MaiM-with-u/maibot",
