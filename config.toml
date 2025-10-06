@@ -1,7 +1,10 @@
 [plugin]
 name = "bilibili_video_sender_plugin"
-version = "1.0.4"
 enabled = true
+
+# MaiBot events_manager 版本兼容性配置
+# false: 旧版本events_manager（0.10.2以下），返回3元组
+use_new_events_manager = false
 
 [bilibili]
 # 是否使用 WBI 签名接口（推荐开启）
@@ -41,7 +44,7 @@ max_video_size_mb = 100
 # 是否启用视频压缩功能
 enable_video_compression = true
 # 压缩质量 (1-51，数值越小质量越高，推荐18-28)
-compression_quality = 21
+compression_quality = 28
 
 [ffmpeg]
 # FFmpeg相关配置
