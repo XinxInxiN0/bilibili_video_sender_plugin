@@ -12,8 +12,8 @@
     "min_version": "0.9.0",
     "man_version": "0.10.3"
   },
-  "homepage_url": "https://github.com/MaiM-with-u/maibot",
-  "repository_url": "https://github.com/MaiM-with-u/maibot",
+  "homepage_url": "https://github.com/XinxInxiN0/bilibili_video_sender_plugin",
+  "repository_url": "https://github.com/XinxInxiN0/bilibili_video_sender_plugin",
   "config_file_name": "config.toml",
   "keywords": ["bilibili", "video", "send"],
   "categories": ["Multimedia", "Utility Tools"],
