@@ -29,8 +29,8 @@ def convert_windows_to_wsl_path(windows_path: str) -> str:
         try:
             # 在Windows上调用wsl wslpath命令
             result = subprocess.run(['wsl', 'wslpath', '-u', windows_path], 
-                                   capture_output=True, text=True, check=True)
-            wsl_path = result.stdout.strip()
+                                   capture_output=True, text=False, check=True)
+            wsl_path = result.stdout.decode('utf-8', errors='replace').strip()
             if wsl_path:
                 return wsl_path
         except (subprocess.SubprocessError, FileNotFoundError):
@@ -150,10 +150,10 @@ class FFmpegManager:
         try:
             # 获取所有可用的编码器
             cmd = [ffmpeg_path, '-encoders']
-            process = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            process = subprocess.run(cmd, capture_output=True, text=False, timeout=15)
             
             if process.returncode == 0:
-                encoders_output = process.stdout
+                encoders_output = process.stdout.decode('utf-8', errors='replace')
                 
                 # 检查每个硬件编码器是否可用
                 for encoder in encoders_to_check:
@@ -165,7 +165,8 @@ class FFmpegManager:
                         else:
                             logger.debug(f"编码器 {encoder['name']} 存在但不可用")
             else:
-                logger.warning(f"获取编码器列表失败: {process.stderr}")
+                stderr_text = process.stderr.decode('utf-8', errors='replace') if process.stderr else ''
+                logger.warning(f"获取编码器列表失败: {stderr_text}")
                 
         except Exception as e:
             logger.warning(f"检测硬件编码器时发生错误: {e}")
@@ -196,7 +197,7 @@ class FFmpegManager:
                 '-'
             ]
             
-            process = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            process = subprocess.run(cmd, capture_output=True, text=False, timeout=10)
             return process.returncode == 0
             
         except Exception:
@@ -242,9 +243,10 @@ class FFmpegManager:
             try:
                 # 获取ffmpeg版本信息
                 cmd = [ffmpeg_path, '-version']
-                process = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                process = subprocess.run(cmd, capture_output=True, text=False, timeout=10)
                 if process.returncode == 0:
-                    version_line = process.stdout.split('\n')[0] if process.stdout else ""
+                    stdout_text = process.stdout.decode('utf-8', errors='replace')
+                    version_line = stdout_text.split('\n')[0] if stdout_text else ""
                     result["ffmpeg_version"] = version_line
                     logger.info(f"FFmpeg版本: {version_line}")
                     
@@ -982,8 +984,6 @@ class BilibiliParser:
         
         # 检查其他配置
         fnval = int(opts.get("fnval", 4048))
-        if fnval not in [1, 16, 80, 64, 32, 128, 256, 512, 1024, 2048, 4096, 8192]:
-            validation_result["warnings"].append(f"fnval值{fnval}不是标准值，可能影响播放")
             
         platform = str(opts.get("platform", "pc"))
         if platform not in ["pc", "html5"]:
@@ -1153,7 +1153,7 @@ class VideoCompressor:
             logger.debug(f"执行FFmpeg压缩命令: {' '.join(cmd)}")
             
             # 执行压缩
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)  # 30分钟超时
+            result = subprocess.run(cmd, capture_output=True, text=False, timeout=1800)  # 30分钟超时
             
             if result.returncode == 0:
                 # 检查压缩后的文件大小
@@ -1173,7 +1173,8 @@ class VideoCompressor:
             else:
                 logger.error(f"视频压缩失败，返回码: {result.returncode}")
                 if result.stderr:
-                    logger.error(f"FFmpeg错误信息: {result.stderr}")
+                    stderr_text = result.stderr.decode('utf-8', errors='replace')
+                    logger.error(f"FFmpeg错误信息: {stderr_text}")
                 return False
                 
         except subprocess.TimeoutExpired:
@@ -1978,7 +1979,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             
             # 发送API请求
             async with aiohttp.ClientSession() as session:
-                async with session.post(api_url, json=request_data, timeout=30) as response:
+                async with session.post(api_url, json=request_data, timeout=300) as response:
                     if response.status == 200:
                         result = await response.json()
                         logger.info(f"私聊视频发送成功: {result}")
@@ -2041,7 +2042,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             
             # 发送API请求
             async with aiohttp.ClientSession() as session:
-                async with session.post(api_url, json=request_data, timeout=30) as response:
+                async with session.post(api_url, json=request_data, timeout=300) as response:
                     if response.status == 200:
                         result = await response.json()
                         logger.info(f"群视频发送成功: {result}")
