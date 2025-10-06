@@ -1,8 +1,10 @@
 [plugin]
 name = "bilibili_video_sender_plugin"
+version = "1.0.5"
 enabled = true
 
 # MaiBot events_manager 版本兼容性配置
+# true: 新版本events_manager（0.10.2及以上），返回5元组
 # false: 旧版本events_manager（0.10.2以下），返回3元组
 use_new_events_manager = false
 
