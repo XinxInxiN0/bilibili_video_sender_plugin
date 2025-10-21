@@ -10,7 +10,7 @@
   "license": "MIT",
   "host_application": {
     "min_version": "0.9.0",
-    "man_version": "0.10.1"
+    "max_version": "0.10.1"
   },
   "homepage_url": "https://github.com/XinxInxiN0/bilibili_video_sender_plugin",
   "repository_url": "https://github.com/XinxInxiN0/bilibili_video_sender_plugin",
@@ -30,5 +30,6 @@
   }
 
 }
+
 
 
