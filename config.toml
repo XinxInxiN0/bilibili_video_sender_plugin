@@ -6,7 +6,7 @@ enabled = true
 # MaiBot events_manager 版本兼容性配置
 # true: 新版本events_manager（0.10.2及以上），返回5元组
 # false: 旧版本events_manager（0.10.2以下），返回3元组
-use_new_events_manager = false
+use_new_events_manager = true
 
 [bilibili]
 # 是否使用 WBI 签名接口（推荐开启）

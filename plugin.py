@@ -1825,7 +1825,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             bool: True表示返回5元组，False表示返回3元组
         """
         # 默认为 False（旧版本），向后兼容
-        return self.get_config("use_new_events_manager", False)
+        return self.get_config("plugin.use_new_events_manager", False)
     
     def _make_return_value(self, success: bool, continue_processing: bool, result: str | None) -> Tuple:
         """根据版本配置生成返回值
@@ -2090,7 +2090,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         from src.common.logger import get_logger
         logger = get_logger("bilibili_handler")
         
-        logger.info("开始处理B站视频链接")
+        #logger.info("开始处理B站视频链接")
         
         if not self.get_config("plugin.enabled", True):
             logger.info("插件已禁用，退出处理")
@@ -2100,7 +2100,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         
         url = BilibiliParser.find_first_bilibili_url(raw)
         if not url:
-            logger.info("未找到B站链接，退出处理")
+            #logger.info("未找到B站链接，退出处理")
             return self._make_return_value(True, True, None)
         
         logger.info(f"找到B站链接: {url}")
