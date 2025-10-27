@@ -22,7 +22,9 @@ try_look = false
 #到这里结束的配置不要改
 
 # 账号 Cookie：更高画质/大会员鉴权必需
+sessdata = ""
 # 可选：用于生成 session 的 buvid3（浏览器 Cookie 中可获得）
+buvid3 = ""
 
 # 视频发送相关配置
 enable_video_splitting = true
