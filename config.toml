@@ -64,7 +64,7 @@ encoder_priority = ["nvidia", "intel", "amd", "apple"]
 
 [wsl]
 # WSL路径转换配置（如果你不知道这是什么，请设为false）
-enable_path_conversion = true
+enable_path_conversion = false
 
 [api]
 # Napcat http服务器（正向）端口
