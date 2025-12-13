@@ -452,14 +452,15 @@ class BilibiliParser:
         # 配置参数
         BilibiliParser._logger.debug("Starting to fetch video playback URLs", aid=aid, cid=cid)
         
-        use_wbi = bool(opts.get("use_wbi", True))
-        prefer_dash = bool(opts.get("prefer_dash", True))
-        fnval = int(opts.get("fnval", 4048 if prefer_dash else 1))
-        fourk = 1 if bool(opts.get("fourk", True)) else 0
-        qn = int(opts.get("qn", 0))
-        platform = str(opts.get("platform", "pc"))
-        high_quality = 1 if bool(opts.get("high_quality", False)) else 0
-        try_look = 1 if bool(opts.get("try_look", False)) else 0
+        # 硬编码配置项
+        use_wbi = True
+        prefer_dash = True
+        fnval = 4048
+        fourk = 0  # false -> 0
+        qn = 0
+        platform = "pc"
+        high_quality = 0  # false -> 0
+        try_look = 0  # false -> 0
         sessdata = str(opts.get("sessdata", "")).strip()
         buvid3 = str(opts.get("buvid3", "")).strip()
         
@@ -706,10 +707,11 @@ class BilibiliParser:
         BilibiliParser._logger.debug(f"Video ID: aid={aid}, cid={cid}")
         BilibiliParser._logger.debug(f"Config: {opts}")
         
-        use_wbi = bool(opts.get("use_wbi", True))
+        # 硬编码配置项
+        use_wbi = True
         fnval = 4048  # 强制使用DASH格式
-        fourk = 1 if bool(opts.get("fourk", True)) else 0
-        platform = str(opts.get("platform", "pc"))
+        fourk = 0  # false -> 0
+        platform = "pc"
         sessdata = str(opts.get("sessdata", "")).strip()
         buvid3 = str(opts.get("buvid3", "")).strip()
         
@@ -923,8 +925,8 @@ class BilibiliParser:
                 validation_result["valid"] = False
 
         
-        # 检查清晰度配置
-        qn = int(opts.get("qn", 0))
+        # 检查清晰度配置（使用硬编码值）
+        qn = 0  # 硬编码值
         if qn > 0:
             qn_info = {
                 6: "240P", 16: "360P", 32: "480P", 64: "720P", 80: "1080P",
@@ -943,10 +945,10 @@ class BilibiliParser:
                 
             BilibiliParser._logger.info(f"清晰度配置: {qn_name} (qn={qn})")
         
-        # 检查其他配置
-        fnval = int(opts.get("fnval", 4048))
+        # 检查其他配置（使用硬编码值）
+        fnval = 4048  # 硬编码值
             
-        platform = str(opts.get("platform", "pc"))
+        platform = "pc"  # 硬编码值
         if platform not in ["pc", "html5"]:
             validation_result["warnings"].append(f"platform值{platform}不是标准值")
             
@@ -2100,14 +2102,16 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
         # 读取并记录配置
         config_opts = {
-            "use_wbi": self.get_config("bilibili.use_wbi", True),
-            "prefer_dash": self.get_config("bilibili.prefer_dash", True),
-            "fnval": self.get_config("bilibili.fnval", 4048),
-            "fourk": self.get_config("bilibili.fourk", True),
-            "qn": self.get_config("bilibili.qn", 0),
-            "platform": self.get_config("bilibili.platform", "pc"),
-            "high_quality": self.get_config("bilibili.high_quality", False),
-            "try_look": self.get_config("bilibili.try_look", False),
+            # 硬编码配置项
+            "use_wbi": True,
+            "prefer_dash": True,
+            "fnval": 4048,
+            "fourk": False,
+            "qn": 0,
+            "platform": "pc",
+            "high_quality": False,
+            "try_look": False,
+            # 从配置文件读取的配置项
             "sessdata": self.get_config("bilibili.sessdata", ""),
             "buvid3": self.get_config("bilibili.buvid3", ""),
             "enable_video_splitting": self.get_config("bilibili.enable_video_splitting", True),
@@ -2403,6 +2407,34 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         # 检查视频时长，决定是否需要分块
         video_duration = BilibiliParser.get_video_duration(temp_path)
         self._logger.debug(f"Detected video duration: {video_duration} seconds")
+        
+        # 检查视频时长限制
+        enable_duration_limit = self.get_config("bilibili.enable_duration_limit", True)
+        max_video_duration = self.get_config("bilibili.max_video_duration", 600)
+        
+        if enable_duration_limit and video_duration is not None:
+            if video_duration > max_video_duration:
+                duration_minutes = int(video_duration // 60)
+                duration_seconds = int(video_duration % 60)
+                max_minutes = int(max_video_duration // 60)
+                max_seconds = int(max_video_duration % 60)
+                
+                error_msg = f"视频时长超过限制：视频时长为 {duration_minutes}分{duration_seconds}秒，最大允许时长为 {max_minutes}分{max_seconds}秒，已拒绝发送。"
+                self._logger.warning(f"Video duration exceeds limit: {video_duration}s > {max_video_duration}s")
+                await self._send_text(error_msg, stream_id)
+                
+                # 清理临时文件
+                try:
+                    os.remove(temp_path)
+                    self._logger.debug("Temporary video file deleted after duration check failure")
+                except Exception as e:
+                    self._logger.warning(f"Failed to delete temporary file: {e}")
+                
+                return self._make_return_value(True, True, "视频时长超过限制")
+            else:
+                self._logger.debug(f"Video duration check passed: {video_duration}s <= {max_video_duration}s")
+        elif enable_duration_limit and video_duration is None:
+            self._logger.warning("Duration limit enabled but ffprobe unavailable, skipping duration check")
         
         # 检查视频文件大小和时长，决定处理策略
         video_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
@@ -2774,25 +2806,20 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "use_new_events_manager": ConfigField(type=bool, default=False, description="是否使用新版events_manager（0.10.2及以上版本设为true，否则设为false）"),
+            "config_version": ConfigField(type=str, default="1.1.0", description="配置版本"),
+            "use_new_events_manager": ConfigField(type=bool, default=True, description="是否使用新版events_manager（0.10.2及以上版本设为true，否则设为false）"),
         },
         "bilibili": {
-            "use_wbi": ConfigField(type=bool, default=True, description="是否使用WBI签名（推荐开启）"),
-            "prefer_dash": ConfigField(type=bool, default=True, description="是否优先使用DASH格式（推荐开启）"),
-            "fnval": ConfigField(type=int, default=4048, description="视频流格式标识（1=MP4, 16=FLV, 80=DASH, 64=MP4+DASH, 32=MP4+FLV+DASH, 128=MP4+FLV+DASH+8K, 256=MP4+FLV+DASH+8K+HDR, 512=MP4+FLV+DASH+8K+HDR+杜比, 1024=MP4+FLV+DASH+8K+HDR+杜比+AV1, 2048=MP4+FLV+DASH+8K+HDR+杜比+AV1+360度, 4096=MP4+FLV+DASH+8K+HDR+杜比+AV1+360度+8K360度, 8192=MP4+FLV+DASH+8K+HDR+杜比+AV1+360度+8K360度+HDR360度）"),
-            "fourk": ConfigField(type=bool, default=True, description="是否允许4K视频（需要大会员）"),
-            "qn": ConfigField(type=int, default=0, description="视频清晰度选择（0=自动, 6=240P, 16=360P, 32=480P, 64=720P, 80=1080P, 112=1080P+, 116=1080P60, 120=4K, 125=HDR, 126=杜比视界）"),
-            "platform": ConfigField(type=str, default="pc", description="平台类型（pc=web播放, html5=移动端HTML5播放）"),
-            "high_quality": ConfigField(type=bool, default=False, description="是否启用高画质模式（platform=html5时有效）"),
-            "try_look": ConfigField(type=bool, default=False, description="是否启用游客高画质尝试模式（未登录时可能获取720P和1080P）"),
             "sessdata": ConfigField(type=str, default="", description="B站登录Cookie中的SESSDATA值（用于获取高清晰度视频）"),
             "buvid3": ConfigField(type=str, default="", description="B站设备标识Buvid3（用于生成session参数）"),
             "enable_video_splitting": ConfigField(type=bool, default=True, description="是否启用视频分块功能"),
             "delete_original_after_split": ConfigField(type=bool, default=True, description="是否在分块后删除原始文件"),
-            "max_video_size_mb": ConfigField(type=int, default=100, description="视频文件大小限制（MB），超过此大小将进行压缩或分割"),
+            "max_video_size_mb": ConfigField(type=int, default=100, description="分片后视频文件大小限制（MB）（不要改）"),
             "enable_video_compression": ConfigField(type=bool, default=True, description="是否启用视频压缩功能"),
             "compression_quality": ConfigField(type=int, default=23, description="视频压缩质量 (1-51，数值越小质量越高，推荐18-28)"),
             "use_optimized_splitting": ConfigField(type=bool, default=True, description="是否使用迭代优化分割算法（获得更接近目标大小的分片，但耗时较长）"),
+            "enable_duration_limit": ConfigField(type=bool, default=True, description="是否启用视频时长限制"),
+            "max_video_duration": ConfigField(type=int, default=600, description="视频最大时长限制（秒），超过此时长将拒绝发送"),
         },
         "ffmpeg": {
             "show_warnings": ConfigField(type=bool, default=True, description="是否显示FFmpeg相关警告信息"),
