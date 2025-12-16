@@ -2,7 +2,7 @@
 发送B站视频链接到群里，麦麦会自动解析并发送视频。
 还有问题加qq3087033824
 觉得好用的话，可以点个star
-### 请务必仔细填写config.toml！！！！！
+### 请务必认真填写config.toml！！！！！
 ### 如果你不知道什么是wsl，请务必保证wsl转换为false！！！
 ## 使用方法
 
@@ -51,7 +51,7 @@
 <img width="1186" height="807" alt="image" src="https://github.com/user-attachments/assets/10c79e45-048a-46c8-8d1d-ca7a4044070c" />
 两个端口要保持一致
 
-### 务必仔细填写config.toml!!!!!!
+### 务必认真填写config.toml!!!!!!
 
 
 ## 完成后的文件夹结构示例
