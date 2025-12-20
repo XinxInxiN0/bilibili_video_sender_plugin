@@ -264,22 +264,6 @@ class FFmpegManager:
 _ffmpeg_manager = FFmpegManager()
 
 
-def _prepare_split_dir() -> str:
-    """清理并准备插件内的 data/split 目录。
-    - 每次下载/分块前调用，确保目录存在且为空。
-    """
-    plugin_dir = os.path.dirname(os.path.abspath(__file__))
-    split_dir = os.path.join(plugin_dir, "data", "split")
-    try:
-        if os.path.exists(split_dir):
-            shutil.rmtree(split_dir)
-        os.makedirs(split_dir, exist_ok=True)
-        _utils_logger.debug(f"分块输出目录: {split_dir}（已清理历史文件）")
-    except Exception as e:
-        _utils_logger.warning(f"准备分块目录失败: {e}")
-        os.makedirs(split_dir, exist_ok=True)
-    return split_dir
-
 
 class ProgressBar:
     """进度条显示类"""
@@ -1233,471 +1217,6 @@ class VideoCompressor:
         return cmd
 
 
-class VideoSplitter:
-    """视频分块处理类"""
-    
-    _logger = get_logger("plugin.bilibili_video_sender.splitter")
-
-    def __init__(self, ffmpeg_path: Optional[str] = None):
-        self.ffmpeg_path = ffmpeg_path or _ffmpeg_manager.get_ffmpeg_path()
-        if not self.ffmpeg_path:
-            self._logger.warning("未找到ffmpeg，将使用系统默认路径")
-            self.ffmpeg_path = 'ffmpeg'
-        
-    def split_video_by_size(self, input_path: str, output_dir: str, max_size_mb: int = 100) -> List[str]:
-        """
-        根据文件大小智能分割视频，优化分片大小接近目标大小
-        
-        Args:
-            input_path: 输入视频路径
-            output_dir: 输出目录
-            max_size_mb: 每个分片的目标大小（MB）
-            
-        Returns:
-            分割后的视频文件路径列表
-        """
-        try:
-            import subprocess
-            import os
-            
-            
-            # 获取视频信息
-            input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
-            self._logger.debug("Starting optimized split", 
-                            input_path=input_path,
-                            input_size_mb=f"{input_size_mb:.2f}",
-                            target_size_mb=max_size_mb)
-            
-            # 获取视频时长
-            duration = BilibiliParser.get_video_duration(input_path)
-            if not duration:
-                self._logger.error("无法获取视频时长，回退到固定时间分割", input_path=input_path)
-                return self.split_video(input_path, output_dir)
-            
-            # 确保输出目录存在
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # 清理输出目录
-            for file in os.listdir(output_dir):
-                if file.startswith('part_') and file.endswith('.mp4'):
-                    os.remove(os.path.join(output_dir, file))
-            
-            # 计算初始分段数 - 更精确的算法
-            # 目标：让每个分片尽可能接近目标大小
-            optimal_segments = max(2, int(input_size_mb / max_size_mb))
-            
-            # 如果文件大小接近目标大小的整数倍，使用精确分段
-            if abs(input_size_mb - optimal_segments * max_size_mb) < max_size_mb * 0.1:
-                optimal_segments = int(input_size_mb / max_size_mb)
-            
-            segment_duration = duration / optimal_segments
-            
-            self._logger.debug("Split strategy calculated", 
-                            duration_seconds=duration,
-                            segments=optimal_segments,
-                            segment_duration=f"{segment_duration:.1f}")
-            
-            # 构建输出文件模式
-            output_pattern = os.path.join(output_dir, f"part_%03d.mp4")
-            
-            # 构建FFmpeg命令
-            cmd = [
-                self.ffmpeg_path,
-                '-i', input_path,
-                '-c', 'copy',  # 复制流，不重新编码
-                '-f', 'segment',
-                '-segment_time', str(segment_duration),  # 使用计算出的分段时间
-                '-reset_timestamps', '1',  # 重置时间戳
-                '-segment_start_number', '0',  # 从0开始编号
-                '-avoid_negative_ts', 'make_zero',  # 避免负时间戳
-                '-y',  # 覆盖现有文件
-                output_pattern
-            ]
-            
-            self._logger.debug(f"Executing FFmpeg split command: {' '.join(cmd)}")
-            
-            # 执行分割 - 修复编码问题
-            result = subprocess.run(cmd, capture_output=True, text=False, timeout=1800)
-            
-            if result.returncode == 0:
-                # 查找生成的分片文件并分析大小
-                split_files = []
-                total_size = 0
-                i = 0
-                
-                while True:
-                    part_path = os.path.join(output_dir, f"part_{i:03d}.mp4")
-                    if os.path.exists(part_path):
-                        file_size = os.path.getsize(part_path)
-                        if file_size > 0:
-                            split_files.append(part_path)
-                            file_size_mb = file_size / (1024 * 1024)
-                            total_size += file_size_mb
-                            self._logger.debug(f"Found split file: {part_path}, size: {file_size_mb:.2f}MB")
-                        else:
-                            self._logger.warning(f"Split file size is 0: {part_path}")
-                        i += 1
-                    else:
-                        break
-                
-                if split_files:
-                    # 分析分片效果
-                    avg_size = total_size / len(split_files)
-                    oversized_count = sum(1 for f in split_files if os.path.getsize(f) / (1024 * 1024) > max_size_mb)
-                    
-                    self._logger.debug(f"Optimized split complete: {len(split_files)} parts")
-                    self._logger.debug(f"Size stats: avg={avg_size:.2f}MB, oversized={oversized_count}")
-                    
-                    # 显示每个分片的详细信息
-                    for i, part_path in enumerate(split_files):
-                        part_size_mb = os.path.getsize(part_path) / (1024 * 1024)
-                        deviation = abs(part_size_mb - max_size_mb)
-                        self._logger.debug(f"Part {i+1}: {part_size_mb:.2f}MB (deviation: {deviation:.2f}MB)")
-                    
-                    return split_files
-                else:
-                    self._logger.error("Optimized split complete but no files found")
-                    return []
-            else:
-                self._logger.error(f"Optimized split failed with code: {result.returncode}")
-                if result.stderr:
-                    stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
-                    self._logger.error(f"FFmpeg error: {stderr_text}")
-                return []
-                
-        except Exception as e:
-            self._logger.error(f"Optimized split exception: {e}")
-            return []
-    
-    def split_video_optimized(self, input_path: str, output_dir: str, target_size_mb: int = 100) -> List[str]:
-        """
-        使用迭代优化算法分割视频，使分片大小尽可能接近目标大小
-        
-        Args:
-            input_path: 输入视频路径
-            output_dir: 输出目录
-            target_size_mb: 每个分片的目标大小（MB）
-            
-        Returns:
-            分割后的视频文件路径列表
-        """
-        try:
-            import subprocess
-            import os
-            
-            
-            # 获取视频信息
-            input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
-            self._logger.debug(f"Starting iterative optimization split: {input_path} ({input_size_mb:.2f}MB) -> target: {target_size_mb}MB")
-            
-            # 获取视频时长
-            duration = BilibiliParser.get_video_duration(input_path)
-            if not duration:
-                self._logger.error("无法获取视频时长，回退到普通分割")
-                return self.split_video_by_size(input_path, output_dir, target_size_mb)
-            
-            # 确保输出目录存在
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # 清理输出目录
-            for file in os.listdir(output_dir):
-                if file.startswith('part_') and file.endswith('.mp4'):
-                    os.remove(os.path.join(output_dir, file))
-            
-            # 迭代优化算法
-            best_result = None
-            best_score = float('inf')
-            
-            # 尝试不同的分段数，找到最佳结果
-            min_segments = max(2, int(input_size_mb / target_size_mb))
-            max_segments = min(int(input_size_mb / (target_size_mb * 0.5)), int(duration / 30))  # 每段至少30秒
-            
-            self._logger.debug(f"Iteration range: {min_segments} - {max_segments} segments")
-            
-            for segments in range(min_segments, max_segments + 1):
-                self._logger.debug(f"Trying {segments} segments")
-                
-                # 清理之前的尝试
-                for file in os.listdir(output_dir):
-                    if file.startswith('part_') and file.endswith('.mp4'):
-                        os.remove(os.path.join(output_dir, file))
-                
-                segment_duration = duration / segments
-                
-                # 构建FFmpeg命令
-                output_pattern = os.path.join(output_dir, f"part_%03d.mp4")
-                cmd = [
-                    self.ffmpeg_path,
-                    '-i', input_path,
-                    '-c', 'copy',
-                    '-f', 'segment',
-                    '-segment_time', str(segment_duration),
-                    '-reset_timestamps', '1',
-                    '-segment_start_number', '0',
-                    '-avoid_negative_ts', 'make_zero',
-                    '-y',
-                    output_pattern
-                ]
-                
-                # 执行分割 - 修复编码问题
-                result = subprocess.run(cmd, capture_output=True, text=False, timeout=900)
-                
-                if result.returncode == 0:
-                    # 分析分割结果
-                    split_files = []
-                    total_deviation = 0
-                    oversized_count = 0
-                    
-                    i = 0
-                    while True:
-                        part_path = os.path.join(output_dir, f"part_{i:03d}.mp4")
-                        if os.path.exists(part_path):
-                            file_size = os.path.getsize(part_path)
-                            if file_size > 0:
-                                split_files.append(part_path)
-                                file_size_mb = file_size / (1024 * 1024)
-                                deviation = abs(file_size_mb - target_size_mb)
-                                total_deviation += deviation
-                                if file_size_mb > target_size_mb:
-                                    oversized_count += 1
-                                self._logger.debug(f"Found split file: part_{i:03d}.mp4, size: {file_size_mb:.2f}MB")
-                            else:
-                                self._logger.debug(f"Skipped empty file: part_{i:03d}.mp4")
-                            i += 1
-                        else:
-                            self._logger.debug(f"Scan complete, no more files found: part_{i:03d}.mp4")
-                            break
-                    
-                    if split_files:
-                        # 计算评分：平均偏差 + 超大分片惩罚
-                        avg_deviation = total_deviation / len(split_files)
-                        score = avg_deviation + (oversized_count * 10)  # 超大分片严重惩罚
-                        
-                        self._logger.debug(f"{segments} segments: avg_deviation={avg_deviation:.2f}MB, oversized={oversized_count}, score={score:.2f}")
-                        
-                        if score < best_score:
-                            best_score = score
-                            # 深度复制文件列表，确保不会被后续清理影响
-                            best_result = []
-                            for split_file in split_files:
-                                # 为最佳结果创建副本文件
-                                best_file = split_file.replace('.mp4', f'_best.mp4')
-                                import shutil
-                                shutil.copy2(split_file, best_file)
-                                best_result.append(best_file)
-                            self._logger.debug(f"New best result: {segments} segments, score={score:.2f}")
-            
-            if best_result:
-                # 显示最佳结果
-                total_size = sum(os.path.getsize(f) for f in best_result) / (1024 * 1024)
-                avg_size = total_size / len(best_result)
-                oversized_count = sum(1 for f in best_result if os.path.getsize(f) / (1024 * 1024) > target_size_mb)
-                
-                self._logger.debug(f"Iterative optimization complete: {len(best_result)} parts")
-                self._logger.debug(f"Size stats: avg={avg_size:.2f}MB, oversized={oversized_count}, best_score={best_score:.2f}")
-                
-                # 显示每个分片的详细信息
-                for i, part_path in enumerate(best_result):
-                    part_size_mb = os.path.getsize(part_path) / (1024 * 1024)
-                    deviation = abs(part_size_mb - target_size_mb)
-                    self._logger.debug(f"Part {i+1}: {part_size_mb:.2f}MB (deviation: {deviation:.2f}MB)")
-                
-                # 清理临时文件（非最佳结果的文件）
-                for file in os.listdir(output_dir):
-                    if file.startswith('part_') and file.endswith('.mp4') and not file.endswith('_best.mp4'):
-                        try:
-                            os.remove(os.path.join(output_dir, file))
-                        except Exception as e:
-                            self._logger.debug(f"Cleaned temp file: {e}")
-                
-                # 重命名最佳结果文件为标准格式
-                final_result = []
-                for i, best_file in enumerate(best_result):
-                    final_file = os.path.join(output_dir, f"part_{i:03d}.mp4")
-                    try:
-                        if os.path.exists(final_file):
-                            os.remove(final_file)
-                        os.rename(best_file, final_file)
-                        final_result.append(final_file)
-                    except Exception as e:
-                        self._logger.warning(f"Failed to rename result file: {e}")
-                        final_result.append(best_file)
-                
-                return final_result
-            else:
-                self._logger.warning("Iterative optimization failed, fallback to normal split")
-                return self.split_video_by_size(input_path, output_dir, target_size_mb)
-                
-        except Exception as e:
-            self._logger.error(f"Iterative optimization exception: {e}")
-            return self.split_video_by_size(input_path, output_dir, target_size_mb)
-    
-    def split_video(self, input_path: str, output_dir: str) -> List[str]:
-        """
-        将视频分割成3分钟长度的片段（固定时间分割）
-        
-        Args:
-            input_path: 输入视频路径
-            output_dir: 输出目录
-            
-        Returns:
-            分割后的视频文件路径列表
-        """
-        try:
-            import subprocess
-            import os
-            
-            
-            self._logger.debug(f"Starting video split: input={input_path}, output directory={output_dir}, split interval=3 minutes")
-            self._logger.debug(f"FFmpeg path: {self.ffmpeg_path}")
-            self._logger.debug(f"Input file exists: {os.path.exists(input_path)}")
-            if os.path.exists(input_path):
-                input_size_mb = os.path.getsize(input_path) / (1024 * 1024)
-                self._logger.debug(f"Input file size: {input_size_mb:.2f}MB")
-            
-            # 确保输出目录存在
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # 获取输入文件名（不含扩展名），处理中文文件名
-            base_name = os.path.splitext(os.path.basename(input_path))[0]
-            
-            # 为了避免Windows上的中文路径问题，使用英文标识符
-            # 构建输出文件模式，使用英文标识符避免编码问题
-            output_pattern = os.path.join(output_dir, f"part_%03d.mp4")
-            
-            # 每3分钟分割一次（180秒）
-            
-            # 构建FFmpeg命令 - 使用基于时间的分片（每3分钟）
-            cmd = [
-                self.ffmpeg_path,
-                '-i', input_path,
-                '-c', 'copy',  # 复制流，不重新编码
-                '-f', 'segment',
-                '-segment_time', '180',  # 每3分钟分割一次（180秒）
-                '-reset_timestamps', '1',  # 重置时间戳
-                '-segment_start_number', '0',  # 从0开始编号
-                '-avoid_negative_ts', 'make_zero',  # 避免负时间戳
-                '-y',  # 覆盖输出文件
-                output_pattern
-            ]
-            
-            # 执行分割命令
-            self._logger.debug(f"Executing FFmpeg split command: {' '.join(cmd)}")
-            
-            # 使用正确的编码设置来避免Windows上的编码问题
-            # 添加环境变量设置，确保FFmpeg能正常工作
-            env = os.environ.copy()
-            env['FFREPORT'] = 'file=ffmpeg_debug.log:level=32'  # 启用FFmpeg调试日志
-            
-            result = subprocess.run(cmd, capture_output=True, text=False, env=env)
-            
-            self._logger.debug(f"FFmpeg split return code: {result.returncode}")
-            if result.stdout:
-                stdout_text = result.stdout.decode('utf-8', errors='replace').strip()
-                # 成功时标准输出通常为进度/信息
-                self._logger.debug(f"FFmpeg split stdout: {stdout_text}")
-            if result.stderr:
-                stderr_text = result.stderr.decode('utf-8', errors='replace').strip()
-                # 注意：FFmpeg 常把普通信息写入 stderr。仅在失败(returncode!=0)时按错误记录
-                if result.returncode == 0:
-                    self._logger.debug(f"FFmpeg split stderr: {stderr_text}")
-                else:
-                    self._logger.error(f"FFmpeg split error: {stderr_text}")
-            
-            if result.returncode != 0:
-                stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
-                self._logger.error(f"视频分割失败: {stderr_text}")
-                # 尝试使用备用分片方法
-                self._logger.debug("尝试使用备用分片方法...")
-                return self._fallback_split_video(input_path, output_dir)
-            
-            # 查找生成的分割文件，使用英文标识符
-            split_files = []
-            i = 0
-            max_attempts = 100  # 防止无限循环
-            
-            # 等待一下，确保文件系统同步
-            import time
-            time.sleep(1)
-            
-            while i < max_attempts:
-                part_path = os.path.join(output_dir, f"part_{i:03d}.mp4")
-                if os.path.exists(part_path):
-                    file_size = os.path.getsize(part_path)
-                    if file_size > 0:  # 确保文件不是空的
-                        split_files.append(part_path)
-                        self._logger.debug(f"Found split file: {part_path}, size: {file_size} bytes")
-                        i += 1
-                    else:
-                        self._logger.warning(f"分块文件大小为0，跳过: {part_path}")
-                        break
-                else:
-                    # 正常结束：下一个顺序分块不存在，停止扫描
-                    self._logger.debug(f"无更多分块，停止扫描。下一个期望: {part_path}")
-                    break
-            
-            if not split_files:
-                self._logger.warning("未找到任何分片文件")
-            
-            self._logger.debug(f"视频分割完成，共生成{len(split_files)}个片段")
-            
-            return split_files
-            
-        except Exception as e:
-            self._logger.error(f"视频分割过程中发生错误: {e}")
-            return []
-    
-    def _fallback_split_video(self, input_path: str, output_dir: str) -> List[str]:
-        """备用视频分片方法，使用更简单的FFmpeg命令"""
-        try:
-            
-            self._logger.debug("使用备用分片方法...")
-            
-            # 确保输出目录存在
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # 使用更简单的分片命令（每3分钟）
-            output_pattern = os.path.join(output_dir, "part_%03d.mp4")
-            
-            cmd = [
-                self.ffmpeg_path,
-                '-i', input_path,
-                '-c', 'copy',
-                '-f', 'segment',
-                '-segment_time', '180',  # 每3分钟分割一次（180秒）
-                '-reset_timestamps', '1',
-                '-y',
-                output_pattern
-            ]
-            
-            self._logger.debug(f"备用分片命令: {' '.join(cmd)}")
-            
-            # 执行命令
-            result = subprocess.run(cmd, capture_output=True, text=False)
-            
-            if result.returncode != 0:
-                stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
-                self._logger.error(f"备用分片也失败: {stderr_text}")
-                return []
-            
-            # 查找生成的文件
-            split_files = []
-            i = 0
-            while i < 100:  # 最多查找100个文件
-                part_path = os.path.join(output_dir, f"part_{i:03d}.mp4")
-                if os.path.exists(part_path) and os.path.getsize(part_path) > 0:
-                    split_files.append(part_path)
-                    self._logger.debug(f"备用方法找到分片: {part_path}")
-                    i += 1
-                else:
-                    break
-            
-            return split_files
-            
-        except Exception as e:
-            self._logger.error(f"备用分片方法也失败: {e}")
-            return []
-
 
 class BilibiliWbiSigner:
     """WBI 签名工具：自动获取 wbi key 并缓存，生成 w_rid/wts"""
@@ -2091,9 +1610,9 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
         if not ffmpeg_info["ffmpeg_available"]:
             if show_ffmpeg_warnings:
-                self._logger.debug("FFmpeg unavailable, merge and split functions disabled")
+                self._logger.debug("FFmpeg unavailable, merge functions disabled")
             else:
-                self._logger.debug("FFmpeg unavailable, merge and split functions disabled")
+                self._logger.debug("FFmpeg unavailable, merge functions disabled")
         if not ffmpeg_info["ffprobe_available"]:
             if show_ffmpeg_warnings:
                 self._logger.debug("ffprobe unavailable, duration detection disabled")
@@ -2114,8 +1633,6 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             # 从配置文件读取的配置项
             "sessdata": self.get_config("bilibili.sessdata", ""),
             "buvid3": self.get_config("bilibili.buvid3", ""),
-            "enable_video_splitting": self.get_config("bilibili.enable_video_splitting", True),
-            "delete_original_after_split": self.get_config("bilibili.delete_original_after_split", True),
         }
         
         # 检查鉴权配置
@@ -2177,9 +1694,6 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
         # 发送解析成功消息
         await self._send_text("解析成功", stream_id)
-
-        # 下载前清理/准备分块目录
-        _prepare_split_dir()
 
         # 同时发送视频文件
         self._logger.debug("Starting video download...")
@@ -2404,7 +1918,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         self._logger.debug(f"Video download completed: {temp_path}")
         caption = f"{info.title}"
 
-        # 检查视频时长，决定是否需要分块
+        # 检查视频时长
         video_duration = BilibiliParser.get_video_duration(temp_path)
         self._logger.debug(f"Detected video duration: {video_duration} seconds")
         
@@ -2441,323 +1955,60 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         self._logger.debug(f"Detected video size: {video_size_mb:.2f}MB")
         
         # 从配置读取相关设置
-        enable_splitting = self.get_config("bilibili.enable_video_splitting", True)
-        delete_original = self.get_config("bilibili.delete_original_after_split", True)
         max_video_size_mb = self.get_config("bilibili.max_video_size_mb", 100)
         enable_compression = self.get_config("bilibili.enable_video_compression", True)
         compression_quality = self.get_config("bilibili.compression_quality", 23)
         
-        self._logger.debug(f"Video processing configuration: splitting={enable_splitting}, compression={enable_compression}, max size={max_video_size_mb}MB, compression quality={compression_quality}")
+        self._logger.debug(f"Video processing configuration: compression={enable_compression}, max size={max_video_size_mb}MB, compression quality={compression_quality}")
         
-        # 新的处理策略：仅基于文件大小分块
-        # 分块条件：启用分块 AND FFmpeg可用 AND 文件过大
-        should_split = (bool(enable_splitting) and 
-                       ffmpeg_info["ffmpeg_available"] and 
-                       video_size_mb > max_video_size_mb)
+        # 处理单个视频文件
+        final_video_path = temp_path
         
-        if enable_splitting and not ffmpeg_info["ffmpeg_available"]:
-            self._logger.warning("Splitting enabled but FFmpeg unavailable, skipping split processing")
-
-        self._logger.debug(f"Processing strategy: should_split={should_split} (file size={video_size_mb:.2f}MB, duration={video_duration} seconds)")
-        
-        if should_split:
-            self._logger.debug("Using pre-split and compression strategy")
+        # 如果文件过大且启用压缩，先压缩
+        if (video_size_mb > max_video_size_mb and
+            enable_compression and
+            ffmpeg_info["ffmpeg_available"]):
+            self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) exceeds limit, starting compression...")
             
-            # 创建分块器 - 使用跨平台FFmpeg管理器
-            ffmpeg_info = _ffmpeg_manager.check_ffmpeg_availability()
-            self._logger.debug(f"FFmpeg availability check: {ffmpeg_info}")
-
-            if not ffmpeg_info["ffmpeg_available"]:
-                self._logger.error("FFmpeg not found in system, unable to split video")
-                should_split = False
-            else:
-                # 使用FFmpeg管理器获取的路径
-                splitter = VideoSplitter(ffmpeg_info["ffmpeg_path"])
-                self._logger.debug(f"Using FFmpeg path: {ffmpeg_info['ffmpeg_path']}")
-            
-            # 准备插件内的持久分块目录：插件目录/data/split
-            split_dir = _prepare_split_dir()
-
-            # 第一步：根据配置选择分割算法
-            use_optimized = self.get_config("bilibili.use_optimized_splitting", True)
-            if use_optimized:
-                self._logger.debug("Using iterative optimization split algorithm, obtaining the most accurate split")
-                split_files = splitter.split_video_optimized(temp_path, split_dir, max_video_size_mb)
-            else:
-                self._logger.debug("Using normal intelligent split algorithm")
-                split_files = splitter.split_video_by_size(temp_path, split_dir, max_video_size_mb)
-            
-            if split_files:
-                self._logger.debug(f"Video split completed, {len(split_files)} segments")
-                
-                # 第二步：检查并压缩超大的分片
-                if enable_compression and ffmpeg_info["ffmpeg_available"]:
-                    self._logger.debug("Starting to check and compress large files...")
-                    # 构建配置字典传递给压缩器
-                    config_dict = {
-                        "ffmpeg": {
-                            "enable_hardware_acceleration": self.get_config("ffmpeg.enable_hardware_acceleration", True),
-                            "force_encoder": self.get_config("ffmpeg.force_encoder", ""),
-                            "encoder_priority": self.get_config("ffmpeg.encoder_priority", ["nvidia", "intel", "amd", "apple"])
-                        }
-                    }
-                    compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"], config_dict)
-                    
-                    final_split_files = []
-                    compression_stats = {"compressed": 0, "skipped": 0, "failed": 0}
-                    
-                    for i, part_path in enumerate(split_files):
-                        part_size_mb = os.path.getsize(part_path) / (1024 * 1024)
-                        self._logger.debug(f"Checking part {i+1}: {part_size_mb:.2f}MB")
-                        
-                        if part_size_mb > max_video_size_mb:
-                            # 需要压缩的分片
-                            self._logger.debug(f"Part {i+1} size ({part_size_mb:.2f}MB) exceeds limit, compressing...")
-                            compressed_part_path = part_path.replace('.mp4', '_compressed.mp4')
-                            
-                            if compressor.compress_video(part_path, compressed_part_path, max_video_size_mb, compression_quality):
-                                compressed_size_mb = os.path.getsize(compressed_part_path) / (1024 * 1024)
-                                self._logger.debug(f"Part {i+1} compression successful: {part_size_mb:.2f}MB -> {compressed_size_mb:.2f}MB")
-                                final_split_files.append(compressed_part_path)
-                                compression_stats["compressed"] += 1
-                                
-                                # 删除原始分片（如果配置允许）
-                                if delete_original:
-                                    try:
-                                        os.remove(part_path)
-                                        self._logger.debug(f"Original part {part_path} deleted")
-                                    except Exception as e:
-                                        self._logger.warning(f"Failed to delete original part: {e}")
-                            else:
-                                self._logger.warning(f"Part {i+1} compression failed, using original file")
-                                final_split_files.append(part_path)
-                                compression_stats["failed"] += 1
-                        else:
-                            # 大小符合要求的分片
-                            self._logger.debug(f"Part {i+1} size meets requirements, no compression needed")
-                            final_split_files.append(part_path)
-                            compression_stats["skipped"] += 1
-                    
-                    self._logger.debug(f"Compression complete: {compression_stats['compressed']} compressed, {compression_stats['skipped']} skipped, {compression_stats['failed']} failed")
-                    split_files = final_split_files
-                else:
-                    self._logger.debug("Compression disabled or FFmpeg unavailable, skipping compression")
-                
-                # 重新扫描split目录，按顺序发送所有分片
-                self._logger.debug("Starting to scan split directory, sending all parts in order")
-                
-                # 调试：显示split目录的实际内容
-                try:
-                    actual_files = os.listdir(split_dir)
-                    self._logger.debug(f"Actual file list in split directory: {actual_files}")
-                    for file in actual_files:
-                        file_path = os.path.join(split_dir, file)
-                        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                        self._logger.debug(f"  - {file}: {file_size_mb:.2f}MB")
-                except Exception as e:
-                    self._logger.warning(f"Unable to read split directory content: {e}")
-                
-                sent_count = 0
-                failed_files = []
-                
-                # 扫描split目录中的所有part_xxx.mp4文件（包括压缩后的文件）
-                all_split_files = []
-                i = 0
-                while True:
-                    # 优先查找压缩后的文件
-                    compressed_filename = f"part_{i:03d}_compressed.mp4"
-                    compressed_path = os.path.join(split_dir, compressed_filename)
-                    
-                    # 然后查找原始文件
-                    original_filename = f"part_{i:03d}.mp4"
-                    original_path = os.path.join(split_dir, original_filename)
-                    
-                    found_file = None
-                    found_filename = None
-                    
-                    # 优先使用压缩后的文件
-                    if os.path.exists(compressed_path) and os.path.getsize(compressed_path) > 0:
-                        found_file = compressed_path
-                        found_filename = compressed_filename
-                        self._logger.debug(f"Found compressed part file: {compressed_filename}")
-                    elif os.path.exists(original_path) and os.path.getsize(original_path) > 0:
-                        found_file = original_path
-                        found_filename = original_filename
-                        self._logger.debug(f"Found original part file: {original_filename}")
-                    
-                    if found_file:
-                        all_split_files.append(found_file)
-                        part_size_mb = os.path.getsize(found_file) / (1024 * 1024)
-                        self._logger.debug(f"Adding part file: {found_filename}, size: {part_size_mb:.2f}MB")
-                        i += 1
-                    else:
-                        self._logger.debug(f"Scan complete, no more files found: {original_filename} or {compressed_filename}")
-                        break
-                
-                self._logger.debug(f"Found {len(all_split_files)} part files, starting to send")
-                
-                # 为所有分片进行WSL路径转换
-                enable_conversion = self.get_config("wsl.enable_path_conversion", True)
-                if enable_conversion:
-                    self._logger.debug("Starting to convert paths for all parts to WSL")
-                    converted_all_split_files = []
-                    for part_path in all_split_files:
-                        converted_path = convert_windows_to_wsl_path(part_path)
-                        converted_all_split_files.append(converted_path)
-                        self._logger.debug(f"Path conversion: {part_path} -> {converted_path}")
-                else:
-                    self._logger.debug("WSL path conversion disabled, using original paths")
-                    converted_all_split_files = all_split_files
-                
-                # 按顺序发送所有分片
-                for i, (original_path, converted_path) in enumerate(zip(all_split_files, converted_all_split_files)):
-                    part_caption = f"{caption} - Part {i+1}"
-                    
-                    if await self._send_video_part(original_path, converted_path, part_caption, stream_id, message):
-                        sent_count += 1
-                        self._logger.debug(f"Part {i+1} sent successfully")
-                    else:
-                        self._logger.debug(f"Part {i+1} failed to send")
-                        failed_files.append(original_path)
-                # 不删除分块文件与目录，保留给外部发送软件使用；将于下一次下载前清理
-                
-                # 根据配置决定是否删除原始下载文件
-                if delete_original:
-                    try:
-                        os.remove(temp_path)
-                        self._logger.debug("Original download file deleted")
-                    except Exception as e:
-                        self._logger.warning(f"Failed to delete original file: {e}")
-                else:
-                    self._logger.debug("Original download file retained")
-                
-                self._logger.info(f"Video split sent successfully, {sent_count}/{len(all_split_files)} parts sent")
-                return self._make_return_value(True, True, f"已发送分块视频（{sent_count}个片段）")
-            else:
-                self._logger.warning("Video split failed, sending original video")
-                # 不在此处清理目录，保持一致性；下一次下载前会清理
-                should_split = False
-        
-        if not should_split:
-            # 处理单个视频文件（不分块）
-            final_video_path = temp_path
-            
-            # 如果文件过大且启用压缩，先压缩
-            if (video_size_mb > max_video_size_mb and 
-                enable_compression and 
-                ffmpeg_info["ffmpeg_available"]):
-                self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) exceeds limit, starting compression...")
-                
-                compressed_path = temp_path.replace('.mp4', '_compressed.mp4')
-                # 构建配置字典传递给压缩器
-                config_dict = {
-                    "ffmpeg": {
-                        "enable_hardware_acceleration": self.get_config("ffmpeg.enable_hardware_acceleration", True),
-                        "force_encoder": self.get_config("ffmpeg.force_encoder", ""),
-                        "encoder_priority": self.get_config("ffmpeg.encoder_priority", ["nvidia", "intel", "amd", "apple"])
-                    }
+            compressed_path = temp_path.replace('.mp4', '_compressed.mp4')
+            # 构建配置字典传递给压缩器
+            config_dict = {
+                "ffmpeg": {
+                    "enable_hardware_acceleration": self.get_config("ffmpeg.enable_hardware_acceleration", True),
+                    "force_encoder": self.get_config("ffmpeg.force_encoder", ""),
+                    "encoder_priority": self.get_config("ffmpeg.encoder_priority", ["nvidia", "intel", "amd", "apple"])
                 }
-                compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"], config_dict)
-                
-                if compressor.compress_video(temp_path, compressed_path, max_video_size_mb, compression_quality):
-                    compressed_size_mb = os.path.getsize(compressed_path) / (1024 * 1024)
-                    self._logger.debug(f"Single video compression successful: {video_size_mb:.2f}MB -> {compressed_size_mb:.2f}MB")
-                    final_video_path = compressed_path
-                    
-                    # 删除原始文件（如果配置允许）
-                    if delete_original:
-                        try:
-                            os.remove(temp_path)
-                            self._logger.debug(f"Original video file {temp_path} deleted")
-                        except Exception as e:
-                            self._logger.warning(f"Failed to delete original video file: {e}")
-                else:
-                    self._logger.debug("Single video compression failed, using original file")
-            elif video_size_mb > max_video_size_mb:
-                self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) exceeds limit but compression not available")
-            else:
-                self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) meets requirements, no compression needed")
+            }
+            compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"], config_dict)
             
-            # 发送处理后的视频文件
-            async def _try_send(path: str) -> bool:
-                # 在发送前进行WSL路径转换
-                enable_conversion = self.get_config("wsl.enable_path_conversion", True)
-                converted_path = convert_windows_to_wsl_path(path) if enable_conversion else path
+            if compressor.compress_video(temp_path, compressed_path, max_video_size_mb, compression_quality):
+                compressed_size_mb = os.path.getsize(compressed_path) / (1024 * 1024)
+                self._logger.debug(f"Single video compression successful: {video_size_mb:.2f}MB -> {compressed_size_mb:.2f}MB")
+                final_video_path = compressed_path
                 
-                self._logger.debug(f"Sending single video - path conversion enabled: {enable_conversion}")
-                self._logger.debug(f"Sending single video - original path: {path}")
-                self._logger.debug(f"Sending single video - converted path: {converted_path}")
-                
-                # 检查是否为私聊消息
-                is_private = self._is_private_message(message)
-                
-                if is_private:
-                    # 私聊消息，使用专用API发送
-                    user_id = self._get_user_id(message)
-                    if user_id:
-                        self._logger.debug(f"Private message detected, sending private video API to user: {user_id}")
-                        return await self._send_private_video(path, converted_path, user_id)
-                    else:
-                        self._logger.error("Private message but unable to get user ID")
-                        return False
-                else:
-                    # 群聊消息，使用群视频API
-                    group_id = self._get_group_id(message)
-                    if group_id:
-                        self._logger.debug(f"Group message detected, sending group video API to group: {group_id}")
-                        return await self._send_group_video(path, converted_path, group_id)
-                    else:
-                        self._logger.error("Group message detected but unable to get group ID, sending failed")
-                        return False
-
-            sent_ok = await _try_send(final_video_path)
-            if not sent_ok:
-                self._logger.debug("Video sending failed")
-                await self._send_text("视频解析成功，但发送失败。请检查网络连接和API配置。", stream_id)
-            else:
-                self._logger.info("Video file sent successfully")
-            
-            # 删除临时文件
-            try:
-                # 删除最终处理的文件
-                if os.path.exists(final_video_path):
-                    os.remove(final_video_path)
-                    self._logger.debug(f"Processed video file {final_video_path} deleted")
-                
-                # 如果还有原始文件且不同于最终文件，也删除
-                if final_video_path != temp_path and os.path.exists(temp_path):
+                # 删除原始文件
+                try:
                     os.remove(temp_path)
                     self._logger.debug(f"Original video file {temp_path} deleted")
-            except Exception as e:
-                self._logger.warning(f"Failed to delete temporary file: {e}")
-            
-        self._logger.info("Bilibili video processing completed")
-        return self._make_return_value(True, True, "已发送视频（若宿主支持）")
-
-    async def _send_video_part(self, original_path: str, converted_path: str, caption: str, stream_id: str, message: MaiMessages) -> bool:
-        """发送视频分块片段
+                except Exception as e:
+                    self._logger.warning(f"Failed to delete original video file: {e}")
+            else:
+                self._logger.debug("Single video compression failed, using original file")
+        elif video_size_mb > max_video_size_mb:
+            self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) exceeds limit but compression not available")
+        else:
+            self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) meets requirements, no compression needed")
         
-        Args:
-            original_path: 原始文件路径（用于文件检查和base64读取）
-            converted_path: 转换后的路径（用于发送URI）
-            caption: 视频标题
-            stream_id: 流ID
-            message: 消息对象
-        """
-        try:
-            # 检查文件是否存在（使用原始路径）
-            if not os.path.exists(original_path):
-                self._logger.error(f"Video part file does not exist: {original_path}")
-                return False
-                
-            # 检查文件大小（使用原始路径）
-            file_size = os.path.getsize(original_path)
-            if file_size == 0:
-                self._logger.error(f"Video part file size is 0: {original_path}")
-                return False
-                
-            self._logger.debug(f"Preparing to send video part: {original_path} -> {converted_path}, size: {file_size} bytes")
-
+        # 发送处理后的视频文件
+        async def _try_send(path: str) -> bool:
+            # 在发送前进行WSL路径转换
+            enable_conversion = self.get_config("wsl.enable_path_conversion", True)
+            converted_path = convert_windows_to_wsl_path(path) if enable_conversion else path
+            
+            self._logger.debug(f"Sending single video - path conversion enabled: {enable_conversion}")
+            self._logger.debug(f"Sending single video - original path: {path}")
+            self._logger.debug(f"Sending single video - converted path: {converted_path}")
+            
             # 检查是否为私聊消息
             is_private = self._is_private_message(message)
             
@@ -2765,8 +2016,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 # 私聊消息，使用专用API发送
                 user_id = self._get_user_id(message)
                 if user_id:
-                    self._logger.debug(f"Private message detected in split video, sending private video API to user: {user_id}")
-                    return await self._send_private_video(original_path, converted_path, user_id)
+                    self._logger.debug(f"Private message detected, sending private video API to user: {user_id}")
+                    return await self._send_private_video(path, converted_path, user_id)
                 else:
                     self._logger.error("Private message but unable to get user ID")
                     return False
@@ -2774,17 +2025,36 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 # 群聊消息，使用群视频API
                 group_id = self._get_group_id(message)
                 if group_id:
-                    self._logger.debug(f"Group message detected in split video, sending group video API to group: {group_id}")
-                    return await self._send_group_video(original_path, converted_path, group_id)
+                    self._logger.debug(f"Group message detected, sending group video API to group: {group_id}")
+                    return await self._send_group_video(path, converted_path, group_id)
                 else:
-                    self._logger.error("Group message detected in split video but unable to get group ID, sending failed")
+                    self._logger.error("Group message detected but unable to get group ID, sending failed")
                     return False
-                
-        except Exception as e:
-            self._logger.debug(f"Failed to send video part: {e}")
 
-        self._logger.error(f"All sending methods failed: {original_path}")
-        return False
+        sent_ok = await _try_send(final_video_path)
+        if not sent_ok:
+            self._logger.debug("Video sending failed")
+            await self._send_text("视频解析成功，但发送失败。请检查网络连接和API配置。", stream_id)
+        else:
+            self._logger.info("Video file sent successfully")
+        
+        # 删除临时文件
+        try:
+            # 删除最终处理的文件
+            if os.path.exists(final_video_path):
+                os.remove(final_video_path)
+                self._logger.debug(f"Processed video file {final_video_path} deleted")
+            
+            # 如果还有原始文件且不同于最终文件，也删除
+            if final_video_path != temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+                self._logger.debug(f"Original video file {temp_path} deleted")
+        except Exception as e:
+            self._logger.warning(f"Failed to delete temporary file: {e}")
+        
+        self._logger.info("Bilibili video processing completed")
+        return self._make_return_value(True, True, "已发送视频（若宿主支持）")
+
 
 @register_plugin
 class BilibiliVideoSenderPlugin(BasePlugin):
@@ -2806,18 +2076,15 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.1.0", description="配置版本"),
+            "config_version": ConfigField(type=str, default="1.2.0", description="配置版本"),
             "use_new_events_manager": ConfigField(type=bool, default=True, description="是否使用新版events_manager（0.10.2及以上版本设为true，否则设为false）"),
         },
         "bilibili": {
             "sessdata": ConfigField(type=str, default="", description="B站登录Cookie中的SESSDATA值（用于获取高清晰度视频）"),
             "buvid3": ConfigField(type=str, default="", description="B站设备标识Buvid3（用于生成session参数）"),
-            "enable_video_splitting": ConfigField(type=bool, default=True, description="是否启用视频分块功能"),
-            "delete_original_after_split": ConfigField(type=bool, default=True, description="是否在分块后删除原始文件"),
-            "max_video_size_mb": ConfigField(type=int, default=100, description="分片后视频文件大小限制（MB）（不要改）"),
+            "max_video_size_mb": ConfigField(type=int, default=100, description="视频文件大小限制（MB），超过此大小将进行压缩"),
             "enable_video_compression": ConfigField(type=bool, default=True, description="是否启用视频压缩功能"),
             "compression_quality": ConfigField(type=int, default=23, description="视频压缩质量 (1-51，数值越小质量越高，推荐18-28)"),
-            "use_optimized_splitting": ConfigField(type=bool, default=True, description="是否使用迭代优化分割算法（获得更接近目标大小的分片，但耗时较长）"),
             "enable_duration_limit": ConfigField(type=bool, default=True, description="是否启用视频时长限制"),
             "max_video_duration": ConfigField(type=int, default=600, description="视频最大时长限制（秒），超过此时长将拒绝发送"),
         },
