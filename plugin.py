@@ -118,8 +118,13 @@ class FFmpegManager:
         self._logger.warning(f"未找到{executable_name}可执行文件")
         return None
 
+    _cached_check_result: Optional[Dict[str, Any]] = None
+
     def check_hardware_encoders(self) -> Dict[str, Any]:
-        """检测可用的硬件编码器"""
+        """检测可用的硬件编码器（带缓存）"""
+        if self._cached_check_result is not None:
+            return self._cached_check_result
+
         ffmpeg_path = self.get_ffmpeg_path()
         if not ffmpeg_path:
             return {"available_encoders": [], "recommended_encoder": "libx264"}
@@ -178,6 +183,7 @@ class FFmpegManager:
             "total_hardware_encoders": len(available_encoders)
         }
         
+        self._cached_check_result = result
         self._logger.debug(f"Hardware encoder detection complete: {len(available_encoders)} available, recommend: {recommended_encoder}")
         return result
     
@@ -217,8 +223,13 @@ class FFmpegManager:
         # 如果没有H.264硬件编码器，返回第一个可用的
         return available_encoders[0]["name"]
 
+    _cached_availability_result: Optional[Dict[str, Any]] = None
+
     def check_ffmpeg_availability(self) -> Dict[str, Any]:
-        """检查FFmpeg可用性"""
+        """检查FFmpeg可用性（带缓存）"""
+        if self._cached_availability_result is not None:
+            return self._cached_availability_result
+
         result = {
             "ffmpeg_available": False,
             "ffprobe_available": False,
@@ -256,6 +267,7 @@ class FFmpegManager:
             result["ffprobe_available"] = True
             result["ffprobe_path"] = ffprobe_path
 
+        self._cached_availability_result = result
         self._logger.debug(f"FFmpeg availability check: ffmpeg={result['ffmpeg_available']}, ffprobe={result['ffprobe_available']}")
         return result
 
@@ -379,11 +391,8 @@ class BilibiliParser:
         # 先匹配 b23.tv 短链
         short = BilibiliParser.B23_SHORT_PATTERN.search(text)
         if short:
-            try:
-                return BilibiliParser._follow_redirect(short.group(0))
-            except Exception:
-                # 回退为原短链
-                return short.group(0)
+            # 直接返回短链接，在异步任务中解析跳转
+            return short.group(0)
 
         # 再匹配标准视频链接
         match = BilibiliParser.VIDEO_URL_PATTERN.search(text)
@@ -1604,20 +1613,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         
 
 
-        # 检查FFmpeg可用性
-        ffmpeg_info = _ffmpeg_manager.check_ffmpeg_availability()
-        show_ffmpeg_warnings = self.get_config("ffmpeg.show_warnings", True)
-
-        if not ffmpeg_info["ffmpeg_available"]:
-            if show_ffmpeg_warnings:
-                self._logger.debug("FFmpeg unavailable, merge functions disabled")
-            else:
-                self._logger.debug("FFmpeg unavailable, merge functions disabled")
-        if not ffmpeg_info["ffprobe_available"]:
-            if show_ffmpeg_warnings:
-                self._logger.debug("ffprobe unavailable, duration detection disabled")
-            else:
-                self._logger.debug("ffprobe unavailable, duration detection disabled")
+        # （原有的FFmpeg同步检查已移除，改为在后台初始化缓存）
 
         # 读取并记录配置
         config_opts = {
@@ -1657,9 +1653,24 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         loop = asyncio.get_running_loop()
 
         def _blocking() -> Optional[Tuple[BilibiliVideoInfo, List[str], str]]:
-            info = BilibiliParser.get_view_info_by_url(url)
+            # 在后台线程处理短链接跳转
+            target_url = url
+            if "b23.tv" in target_url:
+                try:
+                    self._logger.debug(f"Resolving short link: {target_url}")
+                    target_url = BilibiliParser._follow_redirect(target_url)
+                    self._logger.debug(f"Resolved to: {target_url}")
+                except Exception as e:
+                    self._logger.warning(f"Failed to resolve short link: {e}")
+            
+            # 同时也在这里检查FFmpeg可用性（第一次检查比较慢，因为要扫描硬件）
+            if not _ffmpeg_manager._cached_check_result:
+                self._logger.debug("Initializing FFmpeg manager cache in background...")
+                _ffmpeg_manager.check_ffmpeg_availability()
+                
+            info = BilibiliParser.get_view_info_by_url(target_url)
             if not info:
-                self._logger.error("Failed to parse video info", url=url)
+                self._logger.error("Failed to parse video info", url=target_url)
                 return None
                 
             self._logger.debug("Video info parsed", title=info.title, aid=info.aid, cid=info.cid)
@@ -1694,6 +1705,17 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
         # 发送解析成功消息
         await self._send_text("解析成功", stream_id)
+        
+        # 现在获取FFmpeg信息（应该是瞬间完成，因为_blocking已经在后台初始化了缓存）
+        ffmpeg_info = _ffmpeg_manager.check_ffmpeg_availability()
+        
+        # 显示警告（如果需要）
+        show_ffmpeg_warnings = self.get_config("ffmpeg.show_warnings", True)
+        if show_ffmpeg_warnings:
+            if not ffmpeg_info["ffmpeg_available"]:
+                self._logger.debug("FFmpeg unavailable, merge functions disabled")
+            if not ffmpeg_info["ffprobe_available"]:
+                self._logger.debug("ffprobe unavailable, duration detection disabled")
 
         # 同时发送视频文件
         self._logger.debug("Starting video download...")
@@ -1919,7 +1941,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         caption = f"{info.title}"
 
         # 检查视频时长
-        video_duration = BilibiliParser.get_video_duration(temp_path)
+        # 检查视频时长 (异步执行，防止阻塞主循环)
+        video_duration = await loop.run_in_executor(None, BilibiliParser.get_video_duration, temp_path)
         self._logger.debug(f"Detected video duration: {video_duration} seconds")
         
         # 检查视频时长限制
@@ -1937,9 +1960,9 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 self._logger.warning(f"Video duration exceeds limit: {video_duration}s > {max_video_duration}s")
                 await self._send_text(error_msg, stream_id)
                 
-                # 清理临时文件
+                # 清理临时文件 (异步)
                 try:
-                    os.remove(temp_path)
+                    await loop.run_in_executor(None, lambda: os.remove(temp_path) if os.path.exists(temp_path) else None)
                     self._logger.debug("Temporary video file deleted after duration check failure")
                 except Exception as e:
                     self._logger.warning(f"Failed to delete temporary file: {e}")
@@ -1951,7 +1974,12 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             self._logger.warning("Duration limit enabled but ffprobe unavailable, skipping duration check")
         
         # 检查视频文件大小和时长，决定处理策略
-        video_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+        # 检查视频文件大小和时长，决定处理策略 (异步获取大小)
+        try:
+            video_size_mb = await loop.run_in_executor(None, lambda: os.path.getsize(temp_path) / (1024 * 1024))
+        except Exception:
+            video_size_mb = 0.0
+            
         self._logger.debug(f"Detected video size: {video_size_mb:.2f}MB")
         
         # 从配置读取相关设置
@@ -1964,36 +1992,53 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         # 处理单个视频文件
         final_video_path = temp_path
         
+        # 定义压缩任务函数（在线程池中运行，避免阻塞主进程）
+        def _compress_task() -> Optional[str]:
+            try:
+                self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) exceeds limit, starting compression...")
+                
+                compressed_path = temp_path.replace('.mp4', '_compressed.mp4')
+                # 构建配置字典传递给压缩器
+                config_dict = {
+                    "ffmpeg": {
+                        "enable_hardware_acceleration": self.get_config("ffmpeg.enable_hardware_acceleration", True),
+                        "force_encoder": self.get_config("ffmpeg.force_encoder", ""),
+                        "encoder_priority": self.get_config("ffmpeg.encoder_priority", ["nvidia", "intel", "amd", "apple"])
+                    }
+                }
+                compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"], config_dict)
+                
+                # 执行压缩（这是最耗时的部分）
+                if compressor.compress_video(temp_path, compressed_path, max_video_size_mb, compression_quality):
+                    compressed_size_mb = os.path.getsize(compressed_path) / (1024 * 1024)
+                    self._logger.debug(f"Single video compression successful: {video_size_mb:.2f}MB -> {compressed_size_mb:.2f}MB")
+                    
+                    # 压缩成功后清理原始文件
+                    try:
+                        os.remove(temp_path)
+                        self._logger.debug(f"Original video file {temp_path} deleted")
+                    except Exception as e:
+                        self._logger.warning(f"Failed to delete original video file: {e}")
+                        
+                    return compressed_path
+                else:
+                    self._logger.debug("Single video compression failed, using original file")
+                    return None
+            except Exception as e:
+                self._logger.error(f"Compression task error: {e}")
+                return None
+
         # 如果文件过大且启用压缩，先压缩
         if (video_size_mb > max_video_size_mb and
             enable_compression and
             ffmpeg_info["ffmpeg_available"]):
-            self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) exceeds limit, starting compression...")
             
-            compressed_path = temp_path.replace('.mp4', '_compressed.mp4')
-            # 构建配置字典传递给压缩器
-            config_dict = {
-                "ffmpeg": {
-                    "enable_hardware_acceleration": self.get_config("ffmpeg.enable_hardware_acceleration", True),
-                    "force_encoder": self.get_config("ffmpeg.force_encoder", ""),
-                    "encoder_priority": self.get_config("ffmpeg.encoder_priority", ["nvidia", "intel", "amd", "apple"])
-                }
-            }
-            compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"], config_dict)
+            # 将繁重的压缩任务扔进线程池
+            compressed_result = await loop.run_in_executor(None, _compress_task)
             
-            if compressor.compress_video(temp_path, compressed_path, max_video_size_mb, compression_quality):
-                compressed_size_mb = os.path.getsize(compressed_path) / (1024 * 1024)
-                self._logger.debug(f"Single video compression successful: {video_size_mb:.2f}MB -> {compressed_size_mb:.2f}MB")
-                final_video_path = compressed_path
+            if compressed_result:
+                final_video_path = compressed_result
                 
-                # 删除原始文件
-                try:
-                    os.remove(temp_path)
-                    self._logger.debug(f"Original video file {temp_path} deleted")
-                except Exception as e:
-                    self._logger.warning(f"Failed to delete original video file: {e}")
-            else:
-                self._logger.debug("Single video compression failed, using original file")
         elif video_size_mb > max_video_size_mb:
             self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) exceeds limit but compression not available")
         else:
@@ -2039,16 +2084,18 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             self._logger.info("Video file sent successfully")
         
         # 删除临时文件
+        # 删除临时文件 (异步)
         try:
-            # 删除最终处理的文件
-            if os.path.exists(final_video_path):
-                os.remove(final_video_path)
-                self._logger.debug(f"Processed video file {final_video_path} deleted")
+            def _cleanup():
+                # 删除最终处理的文件
+                if os.path.exists(final_video_path):
+                    os.remove(final_video_path)
+                # 如果还有原始文件且不同于最终文件，也删除
+                if final_video_path != temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
             
-            # 如果还有原始文件且不同于最终文件，也删除
-            if final_video_path != temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
-                self._logger.debug(f"Original video file {temp_path} deleted")
+            await loop.run_in_executor(None, _cleanup)
+            self._logger.debug("Video files cleaned up")
         except Exception as e:
             self._logger.warning(f"Failed to delete temporary file: {e}")
         
@@ -2076,7 +2123,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.2.0", description="配置版本"),
+            "config_version": ConfigField(type=str, default="1.3.0", description="配置版本"),
             "use_new_events_manager": ConfigField(type=bool, default=True, description="是否使用新版events_manager（0.10.2及以上版本设为true，否则设为false）"),
         },
         "bilibili": {
