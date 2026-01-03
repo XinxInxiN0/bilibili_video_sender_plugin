@@ -328,11 +328,12 @@ class ProgressBar:
 class BilibiliVideoInfo:
     """基础视频信息。"""
     
-    def __init__(self, aid: int, cid: int, title: str, bvid: Optional[str] = None):
+    def __init__(self, aid: int, cid: int, title: str, bvid: Optional[str] = None, duration: Optional[int] = None):
         self.aid = aid
         self.cid = cid
         self.title = title
         self.bvid = bvid
+        self.duration = duration
 
 
 class BilibiliParser:
@@ -432,6 +433,7 @@ class BilibiliParser:
             cid=int(first_page.get("cid")),
             title=str(data.get("title", "")),
             bvid=str(data.get("bvid", "")) or None,
+            duration=data.get("duration") or first_page.get("duration"),
         )
 
     @staticmethod
@@ -1702,6 +1704,24 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             return self._make_return_value(True, True, "解析失败")
 
         self._logger.info(f"Parse successful: {info.title}")
+
+        # 早期时长校验 (使用 API 返回的时长)
+        enable_duration_limit = self.get_config("bilibili.enable_duration_limit", True)
+        max_video_duration = self.get_config("bilibili.max_video_duration", 600)
+        
+        if enable_duration_limit and info.duration is not None:
+            if info.duration > max_video_duration:
+                duration_minutes = int(info.duration // 60)
+                duration_seconds = int(info.duration % 60)
+                max_minutes = int(max_video_duration // 60)
+                max_seconds = int(max_video_duration % 60)
+                
+                error_msg = f"视频时长超过限制：视频时长为 {duration_minutes}分{duration_seconds}秒，最大允许时长为 {max_minutes}分{max_seconds}秒，已通过在线API检测并拒绝下载。"
+                self._logger.warning(f"Video duration (API) exceeds limit: {info.duration}s > {max_video_duration}s")
+                await self._send_text(error_msg, stream_id)
+                return self._make_return_value(True, True, "视频时长超过限制(API)")
+            else:
+                self._logger.debug(f"Early duration check passed (API): {info.duration}s <= {max_video_duration}s")
 
         # 发送解析成功消息
         await self._send_text("解析成功", stream_id)
