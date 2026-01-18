@@ -1455,7 +1455,15 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         try:
             # 获取配置的端口
             port = self.get_config("api.port", 5700)
-            api_url = f"http://localhost:{port}/send_private_msg"
+            host = self.get_config("api.host", "napcat")
+            token = str(self.get_config("api.token", "")).strip()
+
+            api_url = f"http://{host}:{port}/send_private_msg"   # 群聊就用 send_group_msg
+
+            # NapCat/OneBot 常见 token 方式：access_token 参数（最稳）
+            if token:
+                api_url = f"{api_url}?access_token={urllib.parse.quote(token)}"
+
             
             # 检查文件是否存在（使用原始路径）
             if not os.path.exists(original_path):
@@ -1484,7 +1492,10 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             
             self._logger.debug(f"Sending private video API request: {api_url}")
             self._logger.debug(f"Request data: {request_data}")
-            
+
+            headers = {}
+            if token:
+                headers["Authorization"] = token
             # 发送API请求
             async with aiohttp.ClientSession() as session:
                 async with session.post(api_url, json=request_data, timeout=300) as response:
@@ -1516,7 +1527,15 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         try:
             # 获取配置的端口
             port = self.get_config("api.port", 5700)
-            api_url = f"http://localhost:{port}/send_group_msg"
+            host = self.get_config("api.host", "napcat")
+            token = str(self.get_config("api.token", "")).strip()
+
+            api_url = f"http://{host}:{port}/send_group_msg"   # 群聊就用 send_group_msg
+
+            # NapCat/OneBot 常见 token 方式：access_token 参数（最稳）
+            if token:
+                api_url = f"{api_url}?access_token={urllib.parse.quote(token)}"
+
             
             # 检查文件是否存在（使用原始路径）
             if not os.path.exists(original_path):
@@ -1546,6 +1565,9 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             self._logger.debug(f"Sending group video API request: {api_url}")
             self._logger.debug(f"Request data: {request_data}")
             
+            headers = {}
+            if token:
+                headers["Authorization"] = token
             # 发送API请求
             async with aiohttp.ClientSession() as session:
                 async with session.post(api_url, json=request_data, timeout=300) as response:
@@ -1743,7 +1765,9 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             try:
                 
                 safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", info.title).strip() or "bilibili_video"
-                tmp_dir = tempfile.gettempdir()
+                tmp_dir = "/MaiMBot/data/tmp"
+                os.makedirs(tmp_dir, exist_ok=True)
+
                 temp_path = os.path.join(tmp_dir, f"{safe_title}.mp4")
                 
                 self._logger.debug("Preparing download", title=info.title, temp_path=temp_path)
@@ -2165,7 +2189,9 @@ class BilibiliVideoSenderPlugin(BasePlugin):
             "enable_path_conversion": ConfigField(type=bool, default=True, description="是否启用Windows到WSL的路径转换"),
         },
         "api": {
+            "host": ConfigField(type=str, default="napcat", description="OneBot HTTP API 主机名（Docker 内建议填 napcat）"),
             "port": ConfigField(type=int, default=5700, description="API服务端口号"),
+            "token": ConfigField(type=str, default="", description="OneBot HTTP API Token（与 NapCat HTTP Server Token 一致）"),
         }
     }
 
