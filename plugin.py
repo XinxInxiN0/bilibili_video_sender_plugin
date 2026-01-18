@@ -352,6 +352,104 @@ class BilibiliParser:
         re.IGNORECASE,
     )
     B23_SHORT_PATTERN = re.compile(r"https?://b23\.tv/[\w]+", re.IGNORECASE)
+    QN_INFO = {
+        6: "240P",
+        16: "360P",
+        32: "480P",
+        48: "720P (MP4)",
+        64: "720P",
+        74: "720P60",
+        80: "1080P",
+        112: "1080P+",
+        116: "1080P60",
+        120: "4K",
+        125: "HDR",
+        126: "杜比视界",
+        127: "8K",
+    }
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _get_qn_name(qn: int) -> str:
+        return BilibiliParser.QN_INFO.get(qn, f"未知({qn})")
+
+    @staticmethod
+    def _codec_rank(codecs: str) -> int:
+        if not codecs:
+            return 3
+        codec_lower = codecs.lower()
+        if "avc" in codec_lower or "h264" in codec_lower:
+            return 0
+        if "hev" in codec_lower or "hvc" in codec_lower or "hevc" in codec_lower:
+            return 1
+        if "av01" in codec_lower:
+            return 2
+        return 3
+
+    @staticmethod
+    def _select_video_stream(
+        videos: List[Dict[str, Any]],
+        target_qn: int,
+        strict_qn: bool,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[int], str]:
+        if not videos:
+            return None, None, "no_video"
+
+        eligible = videos
+        if target_qn > 0:
+            if strict_qn:
+                eligible = [
+                    video for video in videos
+                    if BilibiliParser._safe_int(video.get("id")) == target_qn
+                ]
+                if not eligible:
+                    return None, None, "strict_no_match"
+            else:
+                eligible = [
+                    video for video in videos
+                    if BilibiliParser._safe_int(video.get("id")) <= target_qn
+                ]
+        else:
+            eligible = list(videos)
+
+        if not eligible:
+            if strict_qn:
+                return None, None, "strict_no_match"
+            eligible = list(videos)
+            fallback = True
+        else:
+            fallback = False
+
+        if strict_qn and target_qn > 0:
+            candidates = list(eligible)
+        else:
+            best_id = max(
+                (BilibiliParser._safe_int(video.get("id")) for video in eligible),
+                default=0,
+            )
+            if best_id > 0:
+                candidates = [
+                    video for video in eligible
+                    if BilibiliParser._safe_int(video.get("id")) == best_id
+                ]
+            else:
+                candidates = list(eligible)
+
+        candidates.sort(
+            key=lambda video: (
+                BilibiliParser._codec_rank(str(video.get("codecs", ""))),
+                -BilibiliParser._safe_int(video.get("bandwidth")),
+            )
+        )
+        best_video = candidates[0] if candidates else None
+        selected_qn = BilibiliParser._safe_int(best_video.get("id")) if best_video else None
+        return best_video, selected_qn, "fallback" if fallback else "ok"
 
     @staticmethod
     def _build_request(url: str, headers: Optional[Dict[str, str]] = None) -> urllib.request.Request:
@@ -451,13 +549,14 @@ class BilibiliParser:
         use_wbi = True
         prefer_dash = True
         fnval = 4048
-        fourk = 0  # false -> 0
         qn = 0
         platform = "pc"
         high_quality = 0  # false -> 0
         try_look = 0  # false -> 0
         sessdata = str(opts.get("sessdata", "")).strip()
         buvid3 = str(opts.get("buvid3", "")).strip()
+        requested_qn = BilibiliParser._safe_int(opts.get("qn", 0))
+        strict_qn = bool(opts.get("qn_strict", False)) and requested_qn != 0
         
         # 鉴权状态
         has_cookie = bool(sessdata)
@@ -467,36 +566,27 @@ class BilibiliParser:
             BilibiliParser._logger.warning("未提供Cookie，将使用游客模式（清晰度限制）")
         
         # 清晰度选择逻辑优化
-        if qn == 0:
-            if has_cookie:
-                qn = 64  # 登录后默认720P
-            else:
-                qn = 32  # 未登录默认480P
+        if requested_qn == 0:
+            qn = 64 if has_cookie else 32
+            BilibiliParser._logger.debug(f"Auto quality enabled: effective_qn={qn}")
         else:
-            # 检查清晰度权限
-            qn_info = {
-                6: "240P",
-                16: "360P", 
-                32: "480P",
-                64: "720P",
-                80: "1080P",
-                112: "1080P+",
-                116: "1080P60",
-                120: "4K",
-                125: "HDR",
-                126: "杜比视界"
-            }
-            qn_name = qn_info.get(qn, f"未知({qn})")
-            
-            # 清晰度权限检查
-            if qn >= 64 and not has_cookie:
-                BilibiliParser._logger.warning(f"请求{qn_name}清晰度但未登录，可能失败")
-            if qn >= 80 and not has_cookie:
-                BilibiliParser._logger.warning(f"请求{qn_name}清晰度需要大会员账号")
-            if qn >= 116 and not has_cookie:
-                BilibiliParser._logger.warning(f"请求{qn_name}高帧率需要大会员账号")
-            if qn >= 125 and not has_cookie:
-                BilibiliParser._logger.warning(f"请求{qn_name}需要大会员账号")
+            qn = requested_qn
+
+        fourk = 1 if qn >= 120 else 0
+
+        qn_name = BilibiliParser._get_qn_name(qn)
+        if qn >= 64 and not has_cookie:
+            BilibiliParser._logger.warning(f"请求{qn_name}清晰度但未登录，可能失败")
+        if qn >= 80 and not has_cookie:
+            BilibiliParser._logger.warning(f"请求{qn_name}清晰度需要大会员账号")
+        if qn >= 116 and not has_cookie:
+            BilibiliParser._logger.warning(f"请求{qn_name}高帧率需要大会员账号")
+        if qn >= 125 and not has_cookie:
+            BilibiliParser._logger.warning(f"请求{qn_name}需要大会员账号")
+
+        opts["requested_qn"] = requested_qn
+        opts["effective_qn"] = qn
+        opts["qn_strict"] = strict_qn
 
         # 构建请求参数
         params: Dict[str, Any] = {
@@ -655,22 +745,56 @@ class BilibiliParser:
             BilibiliParser._logger.warning("未找到音频流")
         
         # 参考原脚本，按照质量排序（降序）
-        videos.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
         all_audios.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
         
         candidates = []
         
-        # 参考原脚本，选择最高质量的视频流
-        if videos:
-            best_video = videos[0]
-            video_url = best_video.get("baseUrl") or best_video.get("base_url")
-            if video_url:
-                candidates.append(video_url.replace("http:", "https:"))
-                codec = best_video.get("codecs", "unknown")
-                bandwidth = best_video.get("bandwidth", 0)
-                width = best_video.get("width", 0)
-                height = best_video.get("height", 0)
-                BilibiliParser._logger.debug(f"Selected best video stream: {width}x{height}, {codec}, {bandwidth//1000}kbps")
+        # 选择符合清晰度与编码偏好的视频流
+        best_video, selected_qn, selection_status = BilibiliParser._select_video_stream(
+            videos, qn, strict_qn
+        )
+        if not best_video:
+            if selection_status == "strict_no_match":
+                requested_name = BilibiliParser._get_qn_name(requested_qn)
+                return [], f"请求清晰度不可用: {requested_name}"
+            BilibiliParser._logger.error("Failed to select video stream")
+            return [], "未获取到播放地址"
+
+        if selected_qn is not None:
+            selected_name = BilibiliParser._get_qn_name(selected_qn)
+            opts["selected_qn"] = selected_qn
+            opts["selected_qn_name"] = selected_name
+            if requested_qn:
+                requested_name = BilibiliParser._get_qn_name(requested_qn)
+                opts["requested_qn_name"] = requested_name
+            else:
+                opts["requested_qn_name"] = "自动"
+
+            if requested_qn != 0 and selected_qn != requested_qn:
+                BilibiliParser._logger.info(
+                    f"Quality downgrade: requested {requested_name} (qn={requested_qn}), "
+                    f"selected {selected_name} (qn={selected_qn})"
+                )
+            else:
+                BilibiliParser._logger.info(
+                    f"Quality selected: requested_qn={requested_qn}, selected_qn={selected_qn}"
+                )
+
+        if selection_status == "fallback":
+            BilibiliParser._logger.info(
+                f"No eligible streams for qn={qn}, fell back to best available stream"
+            )
+
+        video_url = best_video.get("baseUrl") or best_video.get("base_url")
+        if video_url:
+            candidates.append(video_url.replace("http:", "https:"))
+            codec = best_video.get("codecs", "unknown")
+            bandwidth = best_video.get("bandwidth", 0)
+            width = best_video.get("width", 0)
+            height = best_video.get("height", 0)
+            BilibiliParser._logger.debug(
+                f"Selected best video stream: {width}x{height}, {codec}, {bandwidth//1000}kbps"
+            )
                 
         # 参考原脚本，选择最高质量的音频流
         if all_audios:
@@ -705,10 +829,11 @@ class BilibiliParser:
         # 硬编码配置项
         use_wbi = True
         fnval = 4048  # 强制使用DASH格式
-        fourk = 0  # false -> 0
         platform = "pc"
         sessdata = str(opts.get("sessdata", "")).strip()
         buvid3 = str(opts.get("buvid3", "")).strip()
+        requested_qn = BilibiliParser._safe_int(opts.get("qn", 0))
+        strict_qn = bool(opts.get("qn_strict", False)) and requested_qn != 0
         
         # 记录鉴权状态
         has_cookie = bool(sessdata)
@@ -717,6 +842,28 @@ class BilibiliParser:
         
         if not has_cookie:
             BilibiliParser._logger.warning("Force DASH: no Cookie, may affect HD fetching")
+
+        if requested_qn == 0:
+            qn = 64 if has_cookie else 32
+            BilibiliParser._logger.debug(f"Force DASH auto quality: effective_qn={qn}")
+        else:
+            qn = requested_qn
+
+        fourk = 1 if qn >= 120 else 0
+
+        qn_name = BilibiliParser._get_qn_name(qn)
+        if qn >= 64 and not has_cookie:
+            BilibiliParser._logger.warning(f"Force DASH: 请求{qn_name}清晰度但未登录，可能失败")
+        if qn >= 80 and not has_cookie:
+            BilibiliParser._logger.warning(f"Force DASH: 请求{qn_name}清晰度需要大会员账号")
+        if qn >= 116 and not has_cookie:
+            BilibiliParser._logger.warning(f"Force DASH: 请求{qn_name}高帧率需要大会员账号")
+        if qn >= 125 and not has_cookie:
+            BilibiliParser._logger.warning(f"Force DASH: 请求{qn_name}需要大会员账号")
+
+        opts["requested_qn"] = requested_qn
+        opts["effective_qn"] = qn
+        opts["qn_strict"] = strict_qn
         
         params: Dict[str, Any] = {
             "avid": str(aid),
@@ -727,6 +874,9 @@ class BilibiliParser:
             "fnval": str(fnval),
             "platform": platform,
         }
+
+        if qn > 0:
+            params["qn"] = str(qn)
         
         if buvid3:
             ms = str(int(time.time() * 1000))
@@ -852,22 +1002,55 @@ class BilibiliParser:
             return [], "Missing video or audio streams"
         
         # 按照质量排序
-        videos.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
         all_audios.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
         
         candidates = []
         
-        # 获取最高质量的视频和音频流
-        if videos:
-            best_video = videos[0]
-            video_url = best_video.get("baseUrl") or best_video.get("base_url")
-            if video_url:
-                candidates.append(video_url.replace("http:", "https:"))
-                codec = best_video.get("codecs", "unknown")
-                bandwidth = best_video.get("bandwidth", 0)
-                width = best_video.get("width", 0)
-                height = best_video.get("height", 0)
-                BilibiliParser._logger.debug(f"Force DASH selected video: {width}x{height}, {codec}, {bandwidth//1000}kbps")
+        # 获取符合清晰度与编码偏好的视频流
+        best_video, selected_qn, selection_status = BilibiliParser._select_video_stream(
+            videos, qn, strict_qn
+        )
+        if not best_video:
+            if selection_status == "strict_no_match":
+                requested_name = BilibiliParser._get_qn_name(requested_qn)
+                return [], f"Force DASH: 请求清晰度不可用: {requested_name}"
+            return [], "Force DASH: missing video stream"
+
+        if selected_qn is not None:
+            selected_name = BilibiliParser._get_qn_name(selected_qn)
+            opts["selected_qn"] = selected_qn
+            opts["selected_qn_name"] = selected_name
+            if requested_qn:
+                requested_name = BilibiliParser._get_qn_name(requested_qn)
+                opts["requested_qn_name"] = requested_name
+            else:
+                opts["requested_qn_name"] = "自动"
+
+            if requested_qn != 0 and selected_qn != requested_qn:
+                BilibiliParser._logger.info(
+                    f"Force DASH quality downgrade: requested {requested_name} (qn={requested_qn}), "
+                    f"selected {selected_name} (qn={selected_qn})"
+                )
+            else:
+                BilibiliParser._logger.info(
+                    f"Force DASH quality selected: requested_qn={requested_qn}, selected_qn={selected_qn}"
+                )
+
+        if selection_status == "fallback":
+            BilibiliParser._logger.info(
+                f"Force DASH: no eligible streams for qn={qn}, fell back to best available stream"
+            )
+
+        video_url = best_video.get("baseUrl") or best_video.get("base_url")
+        if video_url:
+            candidates.append(video_url.replace("http:", "https:"))
+            codec = best_video.get("codecs", "unknown")
+            bandwidth = best_video.get("bandwidth", 0)
+            width = best_video.get("width", 0)
+            height = best_video.get("height", 0)
+            BilibiliParser._logger.debug(
+                f"Force DASH selected video: {width}x{height}, {codec}, {bandwidth//1000}kbps"
+            )
             
         if all_audios:
             best_audio = all_audios[0]
@@ -920,25 +1103,28 @@ class BilibiliParser:
                 validation_result["valid"] = False
 
         
-        # 检查清晰度配置（使用硬编码值）
-        qn = 0  # 硬编码值
-        if qn > 0:
-            qn_info = {
-                6: "240P", 16: "360P", 32: "480P", 64: "720P", 80: "1080P",
-                112: "1080P+", 116: "1080P60", 120: "4K", 125: "HDR", 126: "杜比视界"
-            }
-            qn_name = qn_info.get(qn, f"未知({qn})")
-            
-            if qn >= 64 and not sessdata:
-                validation_result["warnings"].append(f"请求{qn_name}清晰度但未配置Cookie，可能失败")
-            if qn >= 80 and not sessdata:
-                validation_result["warnings"].append(f"请求{qn_name}清晰度需要大会员账号")
-            if qn >= 116 and not sessdata:
-                validation_result["warnings"].append(f"请求{qn_name}高帧率需要大会员账号")
-            if qn >= 125 and not sessdata:
-                validation_result["warnings"].append(f"请求{qn_name}需要大会员账号")
-                
-            BilibiliParser._logger.info(f"清晰度配置: {qn_name} (qn={qn})")
+        # 检查清晰度配置
+        requested_qn = BilibiliParser._safe_int(opts.get("qn", 0))
+        strict_qn = bool(opts.get("qn_strict", False)) and requested_qn != 0
+        if requested_qn == 0:
+            effective_qn = 64 if sessdata else 32
+            qn_name = BilibiliParser._get_qn_name(effective_qn)
+            BilibiliParser._logger.info(f"清晰度配置: 自动({qn_name}) (qn=0)")
+        else:
+            effective_qn = requested_qn
+            qn_name = BilibiliParser._get_qn_name(requested_qn)
+            if requested_qn not in BilibiliParser.QN_INFO:
+                validation_result["warnings"].append(f"qn={requested_qn} 不在常见清晰度列表，可能无效")
+            BilibiliParser._logger.info(f"清晰度配置: {qn_name} (qn={requested_qn}, strict={strict_qn})")
+
+        if effective_qn >= 64 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}清晰度但未配置Cookie，可能失败")
+        if effective_qn >= 80 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}清晰度需要大会员账号")
+        if effective_qn >= 116 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}高帧率需要大会员账号")
+        if effective_qn >= 125 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}需要大会员账号")
         
         # 检查其他配置（使用硬编码值）
         fnval = 4048  # 硬编码值
@@ -1460,9 +1646,6 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
             api_url = f"http://{host}:{port}/send_private_msg"   # 群聊就用 send_group_msg
 
-            # NapCat/OneBot 常见 token 方式：access_token 参数（最稳）
-            if token:
-                api_url = f"{api_url}?access_token={urllib.parse.quote(token)}"
 
             
             # 检查文件是否存在（使用原始路径）
@@ -1471,7 +1654,9 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 return False
             
             # 构造本地文件路径，使用file://协议（使用转换后路径）
-            file_uri = f"file://{converted_path}"
+            file_uri = converted_path
+            if not converted_path.startswith(("http://", "https://", "file://")):
+                file_uri = "file:///" + urllib.request.pathname2url(converted_path).lstrip("/")
             
             self._logger.debug(f"Private video send - original path: {original_path}")
             self._logger.debug(f"Private video send - converted path: {converted_path}")
@@ -1495,18 +1680,33 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
             headers = {}
             if token:
-                headers["Authorization"] = token
+                headers["Authorization"] = f"Bearer {token}"
             # 发送API请求
             async with aiohttp.ClientSession() as session:
-                async with session.post(api_url, json=request_data, timeout=300) as response:
+                async with session.post(api_url, json=request_data, headers=headers, timeout=300) as response:
                     if response.status == 200:
                         result = await response.json()
                         self._logger.debug(f"Private video sent successfully: {result}")
                         return True
-                    else:
+                    if response.status in (401, 403) and token:
                         error_text = await response.text()
-                        self._logger.error(f"Failed to send private video: HTTP {response.status}, {error_text}")
-                        return False
+                        self._logger.warning(
+                            f"Private video auth failed ({response.status}), retrying with access_token"
+                        )
+                        retry_url = f"{api_url}?access_token={urllib.parse.quote(token)}"
+                        async with session.post(retry_url, json=request_data, headers=headers, timeout=300) as retry_response:
+                            if retry_response.status == 200:
+                                result = await retry_response.json()
+                                self._logger.debug(f"Private video sent successfully (retry): {result}")
+                                return True
+                            error_text = await retry_response.text()
+                            self._logger.error(
+                                f"Failed to send private video (retry): HTTP {retry_response.status}, {error_text}"
+                            )
+                            return False
+                    error_text = await response.text()
+                    self._logger.error(f"Failed to send private video: HTTP {response.status}, {error_text}")
+                    return False
                         
         except asyncio.TimeoutError:
             self._logger.error("Private video sending timeout")
@@ -1532,9 +1732,6 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
             api_url = f"http://{host}:{port}/send_group_msg"   # 群聊就用 send_group_msg
 
-            # NapCat/OneBot 常见 token 方式：access_token 参数（最稳）
-            if token:
-                api_url = f"{api_url}?access_token={urllib.parse.quote(token)}"
 
             
             # 检查文件是否存在（使用原始路径）
@@ -1543,7 +1740,9 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 return False
             
             # 构造本地文件路径，使用file://协议（使用转换后路径）
-            file_uri = f"file://{converted_path}"
+            file_uri = converted_path
+            if not converted_path.startswith(("http://", "https://", "file://")):
+                file_uri = "file:///" + urllib.request.pathname2url(converted_path).lstrip("/")
             
             self._logger.debug(f"Group video send - original path: {original_path}")
             self._logger.debug(f"Group video send - converted path: {converted_path}")
@@ -1567,18 +1766,33 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             
             headers = {}
             if token:
-                headers["Authorization"] = token
+                headers["Authorization"] = f"Bearer {token}"
             # 发送API请求
             async with aiohttp.ClientSession() as session:
-                async with session.post(api_url, json=request_data, timeout=300) as response:
+                async with session.post(api_url, json=request_data, headers=headers, timeout=300) as response:
                     if response.status == 200:
                         result = await response.json()
                         self._logger.debug(f"Group video sent successfully: {result}")
                         return True
-                    else:
+                    if response.status in (401, 403) and token:
                         error_text = await response.text()
-                        self._logger.error(f"Failed to send group video: HTTP {response.status}, {error_text}")
-                        return False
+                        self._logger.warning(
+                            f"Group video auth failed ({response.status}), retrying with access_token"
+                        )
+                        retry_url = f"{api_url}?access_token={urllib.parse.quote(token)}"
+                        async with session.post(retry_url, json=request_data, headers=headers, timeout=300) as retry_response:
+                            if retry_response.status == 200:
+                                result = await retry_response.json()
+                                self._logger.debug(f"Group video sent successfully (retry): {result}")
+                                return True
+                            error_text = await retry_response.text()
+                            self._logger.error(
+                                f"Failed to send group video (retry): HTTP {retry_response.status}, {error_text}"
+                            )
+                            return False
+                    error_text = await response.text()
+                    self._logger.error(f"Failed to send group video: HTTP {response.status}, {error_text}")
+                    return False
                         
         except asyncio.TimeoutError:
             self._logger.error("Group video sending timeout")
@@ -1646,7 +1860,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             "prefer_dash": True,
             "fnval": 4048,
             "fourk": False,
-            "qn": 0,
+            "qn": BilibiliParser._safe_int(self.get_config("bilibili.qn", 0)),
+            "qn_strict": self.get_config("bilibili.qn_strict", False),
             "platform": "pc",
             "high_quality": False,
             "try_look": False,
@@ -1658,7 +1873,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         # 检查鉴权配置
         if not config_opts['sessdata']:
             self._logger.debug("No SESSDATA configured, using guest mode")
-            if config_opts['qn'] >= 64:
+            if config_opts['qn'] >= 64 and config_opts['qn'] != 0:
                 self._logger.warning(f"Requested quality {config_opts['qn']} but not logged in, may fail")
         if not config_opts['buvid3']:
             self._logger.debug("No Buvid3 configured, session generation may fail")
@@ -1746,7 +1961,17 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 self._logger.debug(f"Early duration check passed (API): {info.duration}s <= {max_video_duration}s")
 
         # 发送解析成功消息
-        await self._send_text("解析成功", stream_id)
+        success_message = "解析成功"
+        selected_qn_name = config_opts.get("selected_qn_name")
+        requested_qn_name = config_opts.get("requested_qn_name")
+        selected_qn = config_opts.get("selected_qn")
+        requested_qn = config_opts.get("requested_qn")
+        if selected_qn_name and selected_qn:
+            if requested_qn and selected_qn and requested_qn != selected_qn:
+                success_message = f"解析成功，已选择{selected_qn_name}（降级自{requested_qn_name}）"
+            else:
+                success_message = f"解析成功，已选择{selected_qn_name}"
+        await self._send_text(success_message, stream_id)
         
         # 现在获取FFmpeg信息（应该是瞬间完成，因为_blocking已经在后台初始化了缓存）
         ffmpeg_info = _ffmpeg_manager.check_ffmpeg_availability()
@@ -1765,10 +1990,12 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             try:
                 
                 safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", info.title).strip() or "bilibili_video"
+                unique_tag = f"{info.aid}_{info.cid}_{int(time.time() * 1000)}"
+                base_name = f"{safe_title}_{unique_tag}"
                 tmp_dir = "/MaiMBot/data/tmp"
                 os.makedirs(tmp_dir, exist_ok=True)
 
-                temp_path = os.path.join(tmp_dir, f"{safe_title}.mp4")
+                temp_path = os.path.join(tmp_dir, f"{base_name}.mp4")
                 
                 self._logger.debug("Preparing download", title=info.title, temp_path=temp_path)
                 
@@ -1797,11 +2024,11 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 
                 # 判断是否是分离的视频和音频流
                 # 注意：这里使用外层的urls变量，需要确保在正确的作用域中调用
-                if len(urls) >= 2 and (".m4s" in urls[0].lower() or ".m4s" in urls[1].lower()):
-                    self._logger.debug("DASH format detected", stream_count=len(urls), format="m4s")
+                if len(urls) >= 2:
+                    self._logger.debug("DASH format assumed by stream count", stream_count=len(urls))
                     
                     # 下载视频流
-                    video_temp = os.path.join(tmp_dir, f"{safe_title}_video.m4s")
+                    video_temp = os.path.join(tmp_dir, f"{base_name}_video.m4s")
 
                     req = BilibiliParser._build_request(urls[0], headers)
                     with urllib.request.urlopen(req, timeout=60) as resp:
@@ -1829,7 +2056,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                         self._logger.debug("Video stream downloaded", size_mb=f"{video_size_mb:.2f}")
                     
                     # 下载音频流
-                    audio_temp = os.path.join(tmp_dir, f"{safe_title}_audio.m4s")
+                    audio_temp = os.path.join(tmp_dir, f"{base_name}_audio.m4s")
                     
                     # 如果有音频URL，下载音频流
                     if len(urls) >= 2:
@@ -1967,10 +2194,65 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                     
                     # 如果所有方法都失败，返回视频流文件
                     self._logger.debug("Using video stream only")
+                    if audio_temp and os.path.exists(audio_temp):
+                        try:
+                            os.remove(audio_temp)
+                            self._logger.debug("Audio temp cleaned after merge failure")
+                        except Exception as e:
+                            self._logger.warning(f"Failed to clean audio temp: {str(e)}")
                     return video_temp
                 
-                # 非分离流：仅支持DASH，跳过单文件下载
-                self._logger.debug("Only DASH streams supported, skipping single file download")
+                # 单文件流下载
+                if len(urls) == 1:
+                    url = urls[0]
+                    parsed_path = urllib.parse.urlparse(url).path
+                    ext = os.path.splitext(parsed_path)[1].lower()
+                    download_path = temp_path
+                    if ext and ext != ".mp4":
+                        download_path = os.path.join(tmp_dir, f"{base_name}{ext}")
+
+                    self._logger.debug("Single file download", url=url, path=download_path)
+                    req = BilibiliParser._build_request(url, headers)
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        total_size = resp.headers.get("content-length")
+                        total_size = int(total_size) if total_size else 0
+                        progress_bar = ProgressBar(total_size, "Video downloading", 30)
+                        with open(download_path, "wb") as f:
+                            downloaded = 0
+                            while True:
+                                chunk = resp.read(1024 * 256)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                progress_bar.update(downloaded)
+                        progress_bar.finish()
+                        video_size_mb = os.path.getsize(download_path) / (1024 * 1024)
+                        self._logger.debug("Single file downloaded", size_mb=f"{video_size_mb:.2f}")
+
+                    final_path = download_path
+                    if ext and ext != ".mp4":
+                        ffmpeg_path = _ffmpeg_manager.get_ffmpeg_path()
+                        if ffmpeg_path:
+                            remux_path = os.path.join(tmp_dir, f"{base_name}.mp4")
+                            remux_cmd = [ffmpeg_path, "-i", download_path, "-c", "copy", "-y", remux_path]
+                            remux_result = subprocess.run(remux_cmd, capture_output=True, text=False)
+                            if remux_result.returncode == 0:
+                                self._logger.debug("Single file remuxed to mp4")
+                                try:
+                                    os.remove(download_path)
+                                except Exception as e:
+                                    self._logger.warning(f"Failed to remove source file after remux: {str(e)}")
+                                final_path = remux_path
+                            else:
+                                stderr_text = remux_result.stderr.decode("utf-8", errors="replace") if remux_result.stderr else ""
+                                self._logger.warning(f"Single file remux failed: {stderr_text}")
+                        else:
+                            self._logger.debug("FFmpeg not found, skipping remux")
+
+                    return final_path
+
+                self._logger.debug("No supported streams found for download")
                 return None
             except Exception as e:
                 self._logger.error(f"Failed to download video: {e}")
@@ -2041,7 +2323,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             try:
                 self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) exceeds limit, starting compression...")
                 
-                compressed_path = temp_path.replace('.mp4', '_compressed.mp4')
+                base_name, _ = os.path.splitext(temp_path)
+                compressed_path = f"{base_name}_compressed.mp4"
                 # 构建配置字典传递给压缩器
                 config_dict = {
                     "ffmpeg": {
@@ -2173,6 +2456,8 @@ class BilibiliVideoSenderPlugin(BasePlugin):
         "bilibili": {
             "sessdata": ConfigField(type=str, default="", description="B站登录Cookie中的SESSDATA值（用于获取高清晰度视频）"),
             "buvid3": ConfigField(type=str, default="", description="B站设备标识Buvid3（用于生成session参数）"),
+            "qn": ConfigField(type=int, default=0, description="清晰度设置(qn)，0为自动（登录默认720P，未登录默认480P）。常见值：6=240P,16=360P,32=480P,48=720P(MP4),64=720P,74=720P60,80=1080P,112=1080P+,116=1080P60,120=4K,125=HDR,126=杜比视界,127=8K"),
+            "qn_strict": ConfigField(type=bool, default=False, description="是否严格按qn选择清晰度。false时会在可用流中自动降级/回退；true时不可用则报错"),
             "max_video_size_mb": ConfigField(type=int, default=100, description="视频文件大小限制（MB），超过此大小将进行压缩"),
             "enable_video_compression": ConfigField(type=bool, default=True, description="是否启用视频压缩功能"),
             "compression_quality": ConfigField(type=int, default=23, description="视频压缩质量 (1-51，数值越小质量越高，推荐18-28)"),
@@ -2186,7 +2471,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
             "encoder_priority": ConfigField(type=list, default=["nvidia", "intel", "amd", "apple"], description="编码器优先级（当检测到多个硬件编码器时的选择顺序）"),
         },
         "wsl": {
-            "enable_path_conversion": ConfigField(type=bool, default=True, description="是否启用Windows到WSL的路径转换"),
+            "enable_path_conversion": ConfigField(type=bool, default=False, description="是否启用Windows到WSL的路径转换"),
         },
         "api": {
             "host": ConfigField(type=str, default="napcat", description="OneBot HTTP API 主机名（Docker 内建议填 napcat）"),
@@ -2199,5 +2484,3 @@ class BilibiliVideoSenderPlugin(BasePlugin):
         return [
             (BilibiliAutoSendHandler.get_handler_info(), BilibiliAutoSendHandler),
         ]
-
-
