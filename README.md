@@ -17,7 +17,7 @@
 
 ## 清晰度设置（config.toml）
 
-在 `[bilibili]` 段新增：
+在 `[bilibili]` 段
 
 ```toml
 [bilibili]
