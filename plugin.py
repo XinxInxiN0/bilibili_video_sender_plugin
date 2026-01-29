@@ -375,7 +375,11 @@ class BilibiliParser:
         r"https?://(?:www\.)?bilibili\.com/video/(?P<bv>BV[\w]+|av\d+)(?:\?[^\s#]+)?",
         re.IGNORECASE,
     )
-    B23_SHORT_PATTERN = re.compile(r"https?://b23\.tv/[\w]+", re.IGNORECASE)
+    B23_SHORT_PATTERN = re.compile(
+        r"https?://b23\.tv/[\w]+(?:\?[^\s#]+)?",
+        re.IGNORECASE,
+    )
+    QN_TEXT_PATTERN = re.compile(r"(?:[?&]|\b)qn\s*=\s*(\d+)", re.IGNORECASE)
     QN_INFO = {
         # 6: "240P 极速", # 仅 MP4 格式支持，仅 `platform=html5` 时有效
         16: "360P 流畅",
@@ -406,6 +410,16 @@ class BilibiliParser:
         return url.rstrip(").,，。!?》】】〕」\"'") if url else url
 
     @staticmethod
+    def _extract_qn_from_text(text: str) -> Optional[int]:
+        """从原始文本中解析 qn 参数，作为 URL 提取丢参时的兜底。"""
+        if not text:
+            return None
+        match = BilibiliParser.QN_TEXT_PATTERN.search(text)
+        if not match:
+            return None
+        return BilibiliParser._safe_int(match.group(1), 0) or None
+
+    @staticmethod
     def _extract_page_param(url: str) -> int:
         """解析分P参数 p，默认为 1。"""
         try:
@@ -416,6 +430,22 @@ class BilibiliParser:
             return p_val if p_val > 0 else 1
         except Exception:
             return 1
+
+    @staticmethod
+    def _extract_qn_param(url: str) -> Optional[int]:
+        """解析清晰度参数 qn，返回 None 表示未指定。"""
+        if not url:
+            return None
+        try:
+            parsed = urllib.parse.urlparse(BilibiliParser._sanitize_url(url))
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            qn_raw = qs.get("qn", [None])[0]
+            if qn_raw is None:
+                return None
+            qn_val = BilibiliParser._safe_int(qn_raw, 0)
+            return qn_val if qn_val > 0 else None
+        except Exception:
+            return None
 
     @staticmethod
     def _normalize_stream_urls(primary: Optional[str], backups: Optional[List[str]] = None) -> List[str]:
@@ -1949,7 +1979,9 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         if not url:
             return self._make_return_value(True, True, None)
 
-        self._logger.info("Bilibili video link detected", url=url)
+        fallback_qn = BilibiliParser._extract_qn_from_text(raw)
+
+        self._logger.info("Bilibili video link detected", url=url, qn_from_text=fallback_qn)
         # 检测到视频链接后，是否阻止后续 AI 回复
         block_ai_reply = self.get_config("bilibili.block_ai_reply", False)
         continue_processing = not block_ai_reply
@@ -2040,6 +2072,19 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                             self._logger.debug(f"Resolved to: {target_url}")
                         except Exception as e:
                             self._logger.warning(f"Failed to resolve short link: {e}")
+
+                    target_url = BilibiliParser._sanitize_url(target_url)
+
+                    # URL 参数覆盖：在解析跳转后的 URL 中提取 qn 参数
+                    url_qn = BilibiliParser._extract_qn_param(target_url)
+                    if url_qn is None and fallback_qn is not None:
+                        url_qn = fallback_qn
+                        self._logger.info("Fallback qn detected from raw text", qn=url_qn)
+                    if url_qn is not None:
+                        self._logger.info(
+                            f"URL quality parameter detected: qn={url_qn}, overriding config value ({config_opts['qn']})"
+                        )
+                        config_opts["qn"] = url_qn
 
                     # 同时也在这里检查FFmpeg可用性（第一次检查比较慢，因为要扫描硬件）
                     if not _ffmpeg_manager._cached_check_result:
