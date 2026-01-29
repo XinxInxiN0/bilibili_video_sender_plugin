@@ -4,3 +4,6 @@ config.toml
 *.toml
 config.toml.backup
 config.toml
+/.kilocode
+/tests
+pytest.ini
