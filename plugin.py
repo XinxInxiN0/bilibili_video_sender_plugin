@@ -2616,8 +2616,8 @@ class BilibiliVideoSenderPlugin(BasePlugin):
             "buvid3": ConfigField(type=str, default="", description="B 站设备标识 Buvid3（可选，用于生成 session 参数）"),
             "qn": ConfigField(type=int, default=0, description="清晰度设置(qn)，0 为自动（登录默认 720P，未登录默认 480P）。常见值：16 = 360P, 32 = 480P, 64 = 720P, 74 = 720P60, 80 = 1080P, 112 = 1080P+, 116 = 1080P60, 120 = 4K, 125 = HDR, 126 = 杜比视界, 127 = 8K"),
             "qn_strict": ConfigField(type=bool, default=False, description="是否严格按 qn 选择清晰度。False 时会在可用流中自动降级/回退；True 时不可用则报错"),
-            "block_ai_reply": ConfigField(type=bool, default=False, description="检测到 B 站视频链接后是否阻止后续 AI 回复（仅影响本次事件链路）（旧版 events_manager 下可能无效）"),
-            "store_plugin_text": ConfigField(type=bool, default=True, description="插件发送的文本消息是否写入历史记录（False 则不入库）"),
+            "block_ai_reply": ConfigField(type=bool, default=True, description="检测到 B 站视频链接后是否阻止后续 AI 回复（仅影响本次事件链路）（旧版 events_manager 下可能无效）"),
+            "store_plugin_text": ConfigField(type=bool, default=False, description="插件发送的文本消息是否写入历史记录（False 则不入库）"),
             "enable_video_compression": ConfigField(type=bool, default=True, description="是否启用视频压缩功能"),
             "max_video_size_mb": ConfigField(type=int, default=100, description="视频文件大小限制（MB），超过此大小将进行压缩"),
             "compression_quality": ConfigField(type=int, default=23, description="视频压缩质量 (1-51，数值越小质量越高，推荐 18-28)"),
@@ -2636,7 +2636,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
         "api": {
             "host": ConfigField(
                 type=str,
-                default="napcat",
+                default="127.0.0.1",
                 description="OneBot HTTP API 主机名/地址：Docker 部署时填服务名 napcat；非 Docker 本机部署可填 localhost/127.0.0.1；跨机部署填对方内网 IP 或域名",
             ),
             "port": ConfigField(
