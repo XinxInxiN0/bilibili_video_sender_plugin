@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import asyncio
@@ -22,10 +23,32 @@ from src.common.logger import get_logger
 _utils_logger = get_logger("plugin.bilibili_video_sender.utils")
 
 
+def _is_running_in_docker() -> bool:
+    """检测当前进程是否运行在 Docker 容器内。"""
+    if os.path.exists("/.dockerenv"):
+        return True
+    cgroup_path = "/proc/1/cgroup"
+    try:
+        with open(cgroup_path, "rt", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        return any(keyword in content for keyword in ("docker", "kubepods", "containerd"))
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def _get_download_temp_dir() -> str:
+    """获取下载临时目录：Docker 使用共享目录，非 Docker 使用系统临时目录。"""
+    if _is_running_in_docker():
+        return "/MaiMBot/data/tmp"
+    return tempfile.gettempdir()
+
+
 def convert_windows_to_wsl_path(windows_path: str) -> str:
     """将Windows路径转换为WSL路径
     
-    例如：E:\path\to\file.mp4 -> /mnt/e/path/to/file.mp4
+    例如：E:\\path\\to\\file.mp4 -> /mnt/e/path/to/file.mp4
     """
     try:
         # 尝试使用wslpath命令转换路径（从Windows调用WSL）
@@ -344,14 +367,149 @@ class BilibiliParser:
     USER_AGENT = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/144.0.0.0 Safari/537.36"
     )
 
+    # 允许匹配携带查询参数的链接（用于保留 ?p= 分P 信息）
     VIDEO_URL_PATTERN = re.compile(
-        r"https?://(?:www\.)?bilibili\.com/video/(?P<bv>BV[\w]+|av\d+)",
+        r"https?://(?:www\.)?bilibili\.com/video/(?P<bv>BV[\w]+|av\d+)(?:\?[^\s#]+)?",
         re.IGNORECASE,
     )
     B23_SHORT_PATTERN = re.compile(r"https?://b23\.tv/[\w]+", re.IGNORECASE)
+    QN_INFO = {
+        # 6: "240P 极速", # 仅 MP4 格式支持，仅 `platform=html5` 时有效
+        16: "360P 流畅",
+        32: "480P 清晰",
+        64: "720P 高清", # WEB 端默认值，无 720P 时则为 720P60
+        74: "720P60 高帧率", # 登录认证
+        80: "1080P 高清", # TV 端与 APP 端默认值，登录认证
+        # 100: "智能修复", # 人工智能增强画质，大会员认证
+        112: "1080P+ 高码率", # 大会员认证
+        116: "1080P60 高帧率", # 大会员认证
+        120: "4K 超清", # 需要 `fnval&128=128` 且 `fourk=1`，大会员认证
+        125: "HDR 真彩色", # 仅支持 DASH 格式，需要 `fnval&64=64`，大会员认证
+        126: "杜比视界", # 仅支持 DASH 格式，需要 `fnval&512=512`，大会员认证
+        127: "8K 超高清", # 仅支持 DASH 格式，需要 `fnval&1024=1024`，大会员认证
+        # 129: "HDR Vivid", # 大会员认证
+    }
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _sanitize_url(url: str) -> str:
+        """清理 URL 尾部可能出现的标点符号，避免解析失败。"""
+        return url.rstrip(").,，。!?》】】〕」\"'") if url else url
+
+    @staticmethod
+    def _extract_page_param(url: str) -> int:
+        """解析分P参数 p，默认为 1。"""
+        try:
+            parsed = urllib.parse.urlparse(url)
+            qs = urllib.parse.parse_qs(parsed.query or "")
+            p_raw = qs.get("p", [None])[0]
+            p_val = BilibiliParser._safe_int(p_raw, 1)
+            return p_val if p_val > 0 else 1
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _normalize_stream_urls(primary: Optional[str], backups: Optional[List[str]] = None) -> List[str]:
+        """合并主链与备链，去重并统一为 https。"""
+        urls: List[str] = []
+        if primary:
+            urls.append(primary)
+        if backups:
+            for item in backups:
+                if item:
+                    urls.append(item)
+        # 去重并统一协议
+        normalized: List[str] = []
+        for u in urls:
+            u2 = u.replace("http:", "https:")
+            if u2 not in normalized:
+                normalized.append(u2)
+        return normalized
+
+    @staticmethod
+    def _get_qn_name(qn: int) -> str:
+        return BilibiliParser.QN_INFO.get(qn, f"未知({qn})")
+
+    @staticmethod
+    def _codec_rank(codecs: str) -> int:
+        if not codecs:
+            return 3
+        codec_lower = codecs.lower()
+        if "avc" in codec_lower or "h264" in codec_lower:
+            return 0
+        if "hev" in codec_lower or "hvc" in codec_lower or "hevc" in codec_lower:
+            return 1
+        if "av01" in codec_lower:
+            return 2
+        return 3
+
+    @staticmethod
+    def _select_video_stream(
+        videos: List[Dict[str, Any]],
+        target_qn: int,
+        strict_qn: bool,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[int], str]:
+        if not videos:
+            return None, None, "no_video"
+
+        eligible = videos
+        if target_qn > 0:
+            if strict_qn:
+                eligible = [
+                    video for video in videos
+                    if BilibiliParser._safe_int(video.get("id")) == target_qn
+                ]
+                if not eligible:
+                    return None, None, "strict_no_match"
+            else:
+                eligible = [
+                    video for video in videos
+                    if BilibiliParser._safe_int(video.get("id")) <= target_qn
+                ]
+        else:
+            eligible = list(videos)
+
+        if not eligible:
+            if strict_qn:
+                return None, None, "strict_no_match"
+            eligible = list(videos)
+            fallback = True
+        else:
+            fallback = False
+
+        if strict_qn and target_qn > 0:
+            candidates = list(eligible)
+        else:
+            best_id = max(
+                (BilibiliParser._safe_int(video.get("id")) for video in eligible),
+                default=0,
+            )
+            if best_id > 0:
+                candidates = [
+                    video for video in eligible
+                    if BilibiliParser._safe_int(video.get("id")) == best_id
+                ]
+            else:
+                candidates = list(eligible)
+
+        candidates.sort(
+            key=lambda video: (
+                BilibiliParser._codec_rank(str(video.get("codecs", ""))),
+                -BilibiliParser._safe_int(video.get("bandwidth")),
+            )
+        )
+        best_video = candidates[0] if candidates else None
+        selected_qn = BilibiliParser._safe_int(best_video.get("id")) if best_video else None
+        return best_video, selected_qn, "fallback" if fallback else "ok"
 
     @staticmethod
     def _build_request(url: str, headers: Optional[Dict[str, str]] = None) -> urllib.request.Request:
@@ -364,8 +522,14 @@ class BilibiliParser:
         return urllib.request.Request(url, headers=default_headers)
 
     @staticmethod
-    def _fetch_json(url: str) -> Dict[str, Any]:
-        req = BilibiliParser._build_request(url)
+    def _fetch_json(url: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """发送 HTTP 请求并解析 JSON。
+
+        说明：
+        - 默认会带上 User-Agent / Referer。
+        - 当需要登录鉴权时，可通过 headers 传入 Cookie。
+        """
+        req = BilibiliParser._build_request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public API
             data = resp.read()
         return json.loads(data.decode("utf-8", errors="ignore"))
@@ -393,18 +557,35 @@ class BilibiliParser:
         short = BilibiliParser.B23_SHORT_PATTERN.search(text)
         if short:
             # 直接返回短链接，在异步任务中解析跳转
-            return short.group(0)
+            return BilibiliParser._sanitize_url(short.group(0))
 
         # 再匹配标准视频链接
         match = BilibiliParser.VIDEO_URL_PATTERN.search(text)
         if match:
-            return match.group(0)
+            return BilibiliParser._sanitize_url(match.group(0))
         return None
 
     @staticmethod
-    def get_view_info_by_url(url: str) -> Optional[BilibiliVideoInfo]:
+    def get_view_info_by_url(
+        url: str,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> Optional[BilibiliVideoInfo]:
         # 优先解析 BV 号
         bvid = BilibiliParser._extract_bvid(url)
+
+        # 解析分 P 参数（默认P1）
+        page_index = BilibiliParser._extract_page_param(url)
+
+        # 准备可选 Cookie（用于登录可见视频）
+        opts = options or {}
+        sessdata = str(opts.get("sessdata", "")).strip()
+        buvid3 = str(opts.get("buvid3", "")).strip()
+        headers: Dict[str, str] = {}
+        if sessdata:
+            cookie_parts = [f"SESSDATA={sessdata}"]
+            if buvid3:
+                cookie_parts.append(f"buvid3={buvid3}")
+            headers["Cookie"] = "; ".join(cookie_parts)
 
         query: str
         if bvid:
@@ -418,7 +599,7 @@ class BilibiliParser:
             query = f"aid={aid}"
 
         api = f"https://api.bilibili.com/x/web-interface/view?{query}"
-        payload = BilibiliParser._fetch_json(api)
+        payload = BilibiliParser._fetch_json(api, headers=headers)
         if payload.get("code") != 0:
             return None
 
@@ -427,13 +608,22 @@ class BilibiliParser:
         if not pages:
             return None
 
-        first_page = pages[0]
+        # 按 p 参数选择分 P，超出范围时回退到 P1
+        if page_index > len(pages):
+            BilibiliParser._logger.warning(
+                f"分P参数超出范围: p={page_index}, total={len(pages)}，回退到 P1"
+            )
+            page_index = 1
+
+        selected_page = pages[page_index - 1]
+        page_duration = selected_page.get("duration")
+
         return BilibiliVideoInfo(
             aid=int(data.get("aid")),
-            cid=int(first_page.get("cid")),
+            cid=int(selected_page.get("cid")),
             title=str(data.get("title", "")),
             bvid=str(data.get("bvid", "")) or None,
-            duration=data.get("duration") or first_page.get("duration"),
+            duration=page_duration if page_duration is not None else data.get("duration"),
         )
 
     @staticmethod
@@ -441,7 +631,7 @@ class BilibiliParser:
         aid: int,
         cid: int,
         options: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[List[str], str]:
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
         opts = options or {}
         
         # 配置参数
@@ -451,13 +641,14 @@ class BilibiliParser:
         use_wbi = True
         prefer_dash = True
         fnval = 4048
-        fourk = 0  # false -> 0
         qn = 0
         platform = "pc"
         high_quality = 0  # false -> 0
         try_look = 0  # false -> 0
         sessdata = str(opts.get("sessdata", "")).strip()
         buvid3 = str(opts.get("buvid3", "")).strip()
+        requested_qn = BilibiliParser._safe_int(opts.get("qn", 0))
+        strict_qn = bool(opts.get("qn_strict", False)) and requested_qn != 0
         
         # 鉴权状态
         has_cookie = bool(sessdata)
@@ -467,36 +658,27 @@ class BilibiliParser:
             BilibiliParser._logger.warning("未提供Cookie，将使用游客模式（清晰度限制）")
         
         # 清晰度选择逻辑优化
-        if qn == 0:
-            if has_cookie:
-                qn = 64  # 登录后默认720P
-            else:
-                qn = 32  # 未登录默认480P
+        if requested_qn == 0:
+            qn = 64 if has_cookie else 32
+            BilibiliParser._logger.debug(f"Auto quality enabled: effective_qn={qn}")
         else:
-            # 检查清晰度权限
-            qn_info = {
-                6: "240P",
-                16: "360P", 
-                32: "480P",
-                64: "720P",
-                80: "1080P",
-                112: "1080P+",
-                116: "1080P60",
-                120: "4K",
-                125: "HDR",
-                126: "杜比视界"
-            }
-            qn_name = qn_info.get(qn, f"未知({qn})")
-            
-            # 清晰度权限检查
-            if qn >= 64 and not has_cookie:
-                BilibiliParser._logger.warning(f"请求{qn_name}清晰度但未登录，可能失败")
-            if qn >= 80 and not has_cookie:
-                BilibiliParser._logger.warning(f"请求{qn_name}清晰度需要大会员账号")
-            if qn >= 116 and not has_cookie:
-                BilibiliParser._logger.warning(f"请求{qn_name}高帧率需要大会员账号")
-            if qn >= 125 and not has_cookie:
-                BilibiliParser._logger.warning(f"请求{qn_name}需要大会员账号")
+            qn = requested_qn
+
+        fourk = 1 if qn >= 120 else 0
+
+        qn_name = BilibiliParser._get_qn_name(qn)
+        if qn >= 64 and not has_cookie:
+            BilibiliParser._logger.warning(f"请求{qn_name}清晰度但未登录，可能失败")
+        if qn >= 80 and not has_cookie:
+            BilibiliParser._logger.warning(f"请求{qn_name}清晰度需要大会员账号")
+        if qn >= 116 and not has_cookie:
+            BilibiliParser._logger.warning(f"请求{qn_name}高帧率需要大会员账号")
+        if qn >= 125 and not has_cookie:
+            BilibiliParser._logger.warning(f"请求{qn_name}需要大会员账号")
+
+        opts["requested_qn"] = requested_qn
+        opts["effective_qn"] = qn
+        opts["qn_strict"] = strict_qn
 
         # 构建请求参数
         params: Dict[str, Any] = {
@@ -532,8 +714,16 @@ class BilibiliParser:
         api_base = (
             "https://api.bilibili.com/x/player/wbi/playurl" if use_wbi else "https://api.bilibili.com/x/player/playurl"
         )
-        
-        final_params = BilibiliWbiSigner.sign_params(params) if use_wbi else params
+
+        if use_wbi:
+            try:
+                final_params = BilibiliWbiSigner.sign_params(params)
+            except Exception as e:
+                BilibiliParser._logger.warning(f"WBI 签名失败，降级到非 WBI 接口: {e}")
+                api_base = "https://api.bilibili.com/x/player/playurl"
+                final_params = params
+        else:
+            final_params = params
         query = urllib.parse.urlencode(final_params)
         api = f"{api_base}?{query}"
 
@@ -544,7 +734,6 @@ class BilibiliParser:
             if buvid3:
                 cookie_parts.append(f"buvid3={buvid3}")
             headers["Cookie"] = "; ".join(cookie_parts)
-            headers["gaia_source"] = sessdata  # 添加 gaia_source
         else:
             BilibiliParser._logger.info("使用游客模式")
 
@@ -555,18 +744,18 @@ class BilibiliParser:
                 data_bytes = resp.read()
         except Exception as e:
             BilibiliParser._logger.error(f"HTTP请求失败: {e}")
-            return [], f"网络请求失败: {e}"
+            return None, f"网络请求失败: {e}"
             
         try:
             payload = json.loads(data_bytes.decode("utf-8", errors="ignore"))
         except Exception as e:
             BilibiliParser._logger.error(f"JSON解析失败: {e}")
-            return [], "响应数据格式错误"
+            return None, "响应数据格式错误"
             
         if payload.get("code") != 0:
             error_msg = payload.get("message", "接口返回错误")
             BilibiliParser._logger.error(f"API返回错误: code={payload.get('code')}, message={error_msg}")
-            return [], error_msg
+            return None, error_msg
 
         BilibiliParser._logger.debug("API请求成功，开始解析响应数据")
         data = payload.get("data", {})
@@ -576,19 +765,22 @@ class BilibiliParser:
         if not dash:
             BilibiliParser._logger.debug("未找到dash格式数据")
             # 检查是否有durl格式
-            durl = data.get("durl")
+            durl = data.get("durl") or []
             if durl:
                 BilibiliParser._logger.debug(f"找到durl格式数据，共{len(durl)}个文件")
-                # 处理durl格式
-                candidates = []
-                for i, item in enumerate(durl):
-                    url = item.get("baseUrl") or item.get("base_url")
-                    if url:
-                        candidates.append(url.replace("http:", "https:"))
-                        BilibiliParser._logger.info(f"添加durl文件{i+1}: {url[:50]}...")
-                if candidates:
-                    return candidates, "ok (durl格式)"
-            return [], "未找到dash数据"
+                # durl 可能为分段视频，目前仅处理第一段
+                if len(durl) > 1:
+                    BilibiliParser._logger.warning(
+                        f"durl为多段视频（{len(durl)}段），当前仅处理第一段"
+                    )
+                item = durl[0]
+                # durl 可能带 backup_url，统一合并后交给下载阶段
+                primary = item.get("url") or item.get("baseUrl") or item.get("base_url")
+                backups = item.get("backup_url") or item.get("backupUrl") or []
+                urls = BilibiliParser._normalize_stream_urls(primary, backups)
+                if urls:
+                    return {"type": "durl", "urls": urls}, "ok (durl格式)"
+            return None, "未找到dash数据"
         
         videos = dash.get("video") or []
         audios = dash.get("audio") or []
@@ -649,52 +841,88 @@ class BilibiliParser:
         
         if not videos:
             BilibiliParser._logger.warning("未找到视频流")
-            return [], "未找到视频流"
+            return None, "未找到视频流"
             
         if not all_audios:
             BilibiliParser._logger.warning("未找到音频流")
         
         # 参考原脚本，按照质量排序（降序）
-        videos.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
         all_audios.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
         
-        candidates = []
         
-        # 参考原脚本，选择最高质量的视频流
-        if videos:
-            best_video = videos[0]
-            video_url = best_video.get("baseUrl") or best_video.get("base_url")
-            if video_url:
-                candidates.append(video_url.replace("http:", "https:"))
-                codec = best_video.get("codecs", "unknown")
-                bandwidth = best_video.get("bandwidth", 0)
-                width = best_video.get("width", 0)
-                height = best_video.get("height", 0)
-                BilibiliParser._logger.debug(f"Selected best video stream: {width}x{height}, {codec}, {bandwidth//1000}kbps")
-                
-        # 参考原脚本，选择最高质量的音频流
+        # 选择符合清晰度与编码偏好的视频流
+        best_video, selected_qn, selection_status = BilibiliParser._select_video_stream(
+            videos, qn, strict_qn
+        )
+        if not best_video:
+            if selection_status == "strict_no_match":
+                requested_name = BilibiliParser._get_qn_name(requested_qn)
+                return None, f"请求清晰度不可用: {requested_name}"
+            BilibiliParser._logger.error("Failed to select video stream")
+            return None, "未获取到播放地址"
+
+        if selected_qn is not None:
+            selected_name = BilibiliParser._get_qn_name(selected_qn)
+            opts["selected_qn"] = selected_qn
+            opts["selected_qn_name"] = selected_name
+            if requested_qn:
+                requested_name = BilibiliParser._get_qn_name(requested_qn)
+                opts["requested_qn_name"] = requested_name
+            else:
+                opts["requested_qn_name"] = "自动"
+
+            if requested_qn != 0 and selected_qn != requested_qn:
+                BilibiliParser._logger.info(
+                    f"Quality downgrade: requested {requested_name} (qn={requested_qn}), "
+                    f"selected {selected_name} (qn={selected_qn})"
+                )
+            else:
+                BilibiliParser._logger.info(
+                    f"Quality selected: requested_qn={requested_qn}, selected_qn={selected_qn}"
+                )
+
+        if selection_status == "fallback":
+            BilibiliParser._logger.info(
+                f"No eligible streams for qn={qn}, fell back to best available stream"
+            )
+
+        # 将 baseUrl 与 backupUrl 合并成优先列表，下载阶段按序尝试
+        video_url = best_video.get("baseUrl") or best_video.get("base_url")
+        video_backups = best_video.get("backupUrl") or best_video.get("backup_url") or []
+        video_urls = BilibiliParser._normalize_stream_urls(video_url, video_backups)
+
+        if video_url:
+            codec = best_video.get("codecs", "unknown")
+            bandwidth = best_video.get("bandwidth", 0)
+            width = best_video.get("width", 0)
+            height = best_video.get("height", 0)
+            BilibiliParser._logger.debug(
+                f"Selected best video stream: {width}x{height}, {codec}, {bandwidth//1000}kbps"
+            )
+
+        audio_urls: List[str] = []
         if all_audios:
             best_audio = all_audios[0]
             audio_url = best_audio.get("baseUrl") or best_audio.get("base_url")
+            audio_backups = best_audio.get("backupUrl") or best_audio.get("backup_url") or []
+            audio_urls = BilibiliParser._normalize_stream_urls(audio_url, audio_backups)
             if audio_url:
-                candidates.append(audio_url.replace("http:", "https:"))
                 codec = best_audio.get("codecs", "unknown")
                 bandwidth = best_audio.get("bandwidth", 0)
                 BilibiliParser._logger.debug(f"Selected best audio stream: {codec}, {bandwidth//1000}kbps")
-                
-        if candidates:
-            BilibiliParser._logger.debug(f"Got {len(candidates)} playback URLs")
-            return candidates, "ok"
-            
+
+        if video_urls:
+            return {"type": "dash", "video_urls": video_urls, "audio_urls": audio_urls}, "ok"
+
         BilibiliParser._logger.error("Failed to get playback URLs")
-        return [], "未获取到播放地址"
+        return None, "未获取到播放地址"
     
     @staticmethod
     def get_play_urls_force_dash(
         aid: int,
         cid: int,
         options: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[List[str], str]:
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
         """强制获取dash格式的视频和音频流"""
         opts = options or {}
         
@@ -705,10 +933,11 @@ class BilibiliParser:
         # 硬编码配置项
         use_wbi = True
         fnval = 4048  # 强制使用DASH格式
-        fourk = 0  # false -> 0
         platform = "pc"
         sessdata = str(opts.get("sessdata", "")).strip()
         buvid3 = str(opts.get("buvid3", "")).strip()
+        requested_qn = BilibiliParser._safe_int(opts.get("qn", 0))
+        strict_qn = bool(opts.get("qn_strict", False)) and requested_qn != 0
         
         # 记录鉴权状态
         has_cookie = bool(sessdata)
@@ -717,6 +946,28 @@ class BilibiliParser:
         
         if not has_cookie:
             BilibiliParser._logger.warning("Force DASH: no Cookie, may affect HD fetching")
+
+        if requested_qn == 0:
+            qn = 64 if has_cookie else 32
+            BilibiliParser._logger.debug(f"Force DASH auto quality: effective_qn={qn}")
+        else:
+            qn = requested_qn
+
+        fourk = 1 if qn >= 120 else 0
+
+        qn_name = BilibiliParser._get_qn_name(qn)
+        if qn >= 64 and not has_cookie:
+            BilibiliParser._logger.warning(f"Force DASH: 请求{qn_name}清晰度但未登录，可能失败")
+        if qn >= 80 and not has_cookie:
+            BilibiliParser._logger.warning(f"Force DASH: 请求{qn_name}清晰度需要大会员账号")
+        if qn >= 116 and not has_cookie:
+            BilibiliParser._logger.warning(f"Force DASH: 请求{qn_name}高帧率需要大会员账号")
+        if qn >= 125 and not has_cookie:
+            BilibiliParser._logger.warning(f"Force DASH: 请求{qn_name}需要大会员账号")
+
+        opts["requested_qn"] = requested_qn
+        opts["effective_qn"] = qn
+        opts["qn_strict"] = strict_qn
         
         params: Dict[str, Any] = {
             "avid": str(aid),
@@ -727,6 +978,9 @@ class BilibiliParser:
             "fnval": str(fnval),
             "platform": platform,
         }
+
+        if qn > 0:
+            params["qn"] = str(qn)
         
         if buvid3:
             ms = str(int(time.time() * 1000))
@@ -740,8 +994,16 @@ class BilibiliParser:
         api_base = (
             "https://api.bilibili.com/x/player/wbi/playurl" if use_wbi else "https://api.bilibili.com/x/player/playurl"
         )
-        
-        final_params = BilibiliWbiSigner.sign_params(params) if use_wbi else params
+
+        if use_wbi:
+            try:
+                final_params = BilibiliWbiSigner.sign_params(params)
+            except Exception as e:
+                BilibiliParser._logger.warning(f"Force DASH: WBI签名失败，降级到非WBI接口: {e}")
+                api_base = "https://api.bilibili.com/x/player/playurl"
+                final_params = params
+        else:
+            final_params = params
         query = urllib.parse.urlencode(final_params)
         api = f"{api_base}?{query}"
 
@@ -751,7 +1013,6 @@ class BilibiliParser:
             if buvid3:
                 cookie_parts.append(f"buvid3={buvid3}")
             headers["Cookie"] = "; ".join(cookie_parts)
-            headers["gaia_source"] = sessdata  # 添加 gaia_source
 
         try:
             req = BilibiliParser._build_request(api, headers=headers)
@@ -759,39 +1020,42 @@ class BilibiliParser:
                 data_bytes = resp.read()
         except Exception as e:
             BilibiliParser._logger.error(f"Force DASH HTTP error: {e}")
-            return [], f"Force DASH network error: {e}"
+            return None, f"Force DASH network error: {e}"
             
         try:
             payload = json.loads(data_bytes.decode("utf-8", errors="ignore"))
         except Exception as e:
             BilibiliParser._logger.error(f"Force DASH JSON parse error: {e}")
-            return [], "Force DASH response format error"
+            return None, "Force DASH response format error"
             
         if payload.get("code") != 0:
             error_msg = payload.get("message", "API error")
             BilibiliParser._logger.error(f"Force DASH API error: code={payload.get('code')}, msg={error_msg}")
-            return [], error_msg
+            return None, error_msg
 
         BilibiliParser._logger.debug("Force DASH request successful, parsing response")
         data = payload.get("data", {})
         
         # 检查是否仍然返回durl格式
-        durl = data.get("durl")
+        durl = data.get("durl") or []
         if durl:
             BilibiliParser._logger.debug(f"Force DASH also returned durl format: {len(durl)} files (single-file only)")
-            # 记录durl文件信息
-            for i, item in enumerate(durl):
-                url = item.get("baseUrl") or item.get("base_url")
-                size = item.get("size", 0)
-                BilibiliParser._logger.info(f"Force DASH durl文件{i+1}: 大小={size//1024//1024}MB, URL={url[:50]}...")
-            return [], "Video has single-file format only"
+            if len(durl) > 1:
+                BilibiliParser._logger.warning(f"Force DASH: durl为多段视频（{len(durl)}段），当前仅处理第一段")
+            item = durl[0]
+            # durl 可能带 backup_url，统一合并后交给下载阶段
+            primary = item.get("url") or item.get("baseUrl") or item.get("base_url")
+            backups = item.get("backup_url") or item.get("backupUrl") or []
+            urls = BilibiliParser._normalize_stream_urls(primary, backups)
+            if urls:
+                return {"type": "durl", "urls": urls}, "ok (durl格式)"
         
         dash = data.get("dash")
         if not dash:
             BilibiliParser._logger.warning("Force DASH: no dash data found")
             # 检查其他可能的数据结构
             BilibiliParser._logger.info(f"Force DASH response data structure: {list(data.keys())}")
-            return [], "No dash data"
+            return None, "No dash data"
         
         videos = dash.get("video") or []
         audios = dash.get("audio") or []
@@ -849,41 +1113,76 @@ class BilibiliParser:
         
         if not videos or not all_audios:
             BilibiliParser._logger.warning(f"Force DASH: missing streams - video={len(videos)}, audio={len(all_audios)}")
-            return [], "Missing video or audio streams"
+            return None, "Missing video or audio streams"
         
         # 按照质量排序
-        videos.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
         all_audios.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
         
-        candidates = []
         
-        # 获取最高质量的视频和音频流
-        if videos:
-            best_video = videos[0]
-            video_url = best_video.get("baseUrl") or best_video.get("base_url")
-            if video_url:
-                candidates.append(video_url.replace("http:", "https:"))
-                codec = best_video.get("codecs", "unknown")
-                bandwidth = best_video.get("bandwidth", 0)
-                width = best_video.get("width", 0)
-                height = best_video.get("height", 0)
-                BilibiliParser._logger.debug(f"Force DASH selected video: {width}x{height}, {codec}, {bandwidth//1000}kbps")
-            
+        # 获取符合清晰度与编码偏好的视频流
+        best_video, selected_qn, selection_status = BilibiliParser._select_video_stream(
+            videos, qn, strict_qn
+        )
+        if not best_video:
+            if selection_status == "strict_no_match":
+                requested_name = BilibiliParser._get_qn_name(requested_qn)
+                return None, f"Force DASH: 请求清晰度不可用: {requested_name}"
+            return None, "Force DASH: missing video stream"
+
+        if selected_qn is not None:
+            selected_name = BilibiliParser._get_qn_name(selected_qn)
+            opts["selected_qn"] = selected_qn
+            opts["selected_qn_name"] = selected_name
+            if requested_qn:
+                requested_name = BilibiliParser._get_qn_name(requested_qn)
+                opts["requested_qn_name"] = requested_name
+            else:
+                opts["requested_qn_name"] = "自动"
+
+            if requested_qn != 0 and selected_qn != requested_qn:
+                BilibiliParser._logger.info(
+                    f"Force DASH quality downgrade: requested {requested_name} (qn={requested_qn}), "
+                    f"selected {selected_name} (qn={selected_qn})"
+                )
+            else:
+                BilibiliParser._logger.info(
+                    f"Force DASH quality selected: requested_qn={requested_qn}, selected_qn={selected_qn}"
+                )
+
+        if selection_status == "fallback":
+            BilibiliParser._logger.info(
+                f"Force DASH: no eligible streams for qn={qn}, fell back to best available stream"
+            )
+
+        # 将 baseUrl 与 backupUrl 合并成优先列表，下载阶段按序尝试
+        video_url = best_video.get("baseUrl") or best_video.get("base_url")
+        video_backups = best_video.get("backupUrl") or best_video.get("backup_url") or []
+        video_urls = BilibiliParser._normalize_stream_urls(video_url, video_backups)
+
+        if video_url:
+            codec = best_video.get("codecs", "unknown")
+            bandwidth = best_video.get("bandwidth", 0)
+            width = best_video.get("width", 0)
+            height = best_video.get("height", 0)
+            BilibiliParser._logger.debug(
+                f"Force DASH selected video: {width}x{height}, {codec}, {bandwidth//1000}kbps"
+            )
+
+        audio_urls: List[str] = []
         if all_audios:
             best_audio = all_audios[0]
             audio_url = best_audio.get("baseUrl") or best_audio.get("base_url")
+            audio_backups = best_audio.get("backupUrl") or best_audio.get("backup_url") or []
+            audio_urls = BilibiliParser._normalize_stream_urls(audio_url, audio_backups)
             if audio_url:
-                candidates.append(audio_url.replace("http:", "https:"))
                 codec = best_audio.get("codecs", "unknown")
                 bandwidth = best_audio.get("bandwidth", 0)
                 BilibiliParser._logger.debug(f"Force DASH selected audio: {codec}, {bandwidth//1000}kbps")
-        
-        if len(candidates) >= 2:
-            BilibiliParser._logger.debug("Force DASH: got complete video and audio streams")
-            return candidates, "ok"
-        else:
-            BilibiliParser._logger.warning("Force DASH: incomplete streams")
-            return candidates, "Incomplete video and audio streams"
+
+        if video_urls:
+            return {"type": "dash", "video_urls": video_urls, "audio_urls": audio_urls}, "ok"
+
+        return None, "Force DASH: no usable streams"
 
     @staticmethod
     def validate_config(options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -912,33 +1211,35 @@ class BilibiliParser:
                 validation_result["valid"] = False
                 
         if not buvid3:
-            validation_result["warnings"].append("未配置Buvid3，session参数生成可能失败")
-            validation_result["recommendations"].append("建议配置Buvid3以确保session参数正常生成")
+            # buvid3 为可选项，仅影响 session 参数生成
+            validation_result["recommendations"].append("未配置Buvid3（可选），如需生成session参数可补充")
         else:
             if len(buvid3) < 10:
-                validation_result["errors"].append("Buvid3长度异常，可能配置错误")
-                validation_result["valid"] = False
+                validation_result["warnings"].append("Buvid3长度异常，可能配置错误（非必填）")
 
         
-        # 检查清晰度配置（使用硬编码值）
-        qn = 0  # 硬编码值
-        if qn > 0:
-            qn_info = {
-                6: "240P", 16: "360P", 32: "480P", 64: "720P", 80: "1080P",
-                112: "1080P+", 116: "1080P60", 120: "4K", 125: "HDR", 126: "杜比视界"
-            }
-            qn_name = qn_info.get(qn, f"未知({qn})")
-            
-            if qn >= 64 and not sessdata:
-                validation_result["warnings"].append(f"请求{qn_name}清晰度但未配置Cookie，可能失败")
-            if qn >= 80 and not sessdata:
-                validation_result["warnings"].append(f"请求{qn_name}清晰度需要大会员账号")
-            if qn >= 116 and not sessdata:
-                validation_result["warnings"].append(f"请求{qn_name}高帧率需要大会员账号")
-            if qn >= 125 and not sessdata:
-                validation_result["warnings"].append(f"请求{qn_name}需要大会员账号")
-                
-            BilibiliParser._logger.info(f"清晰度配置: {qn_name} (qn={qn})")
+        # 检查清晰度配置
+        requested_qn = BilibiliParser._safe_int(opts.get("qn", 0))
+        strict_qn = bool(opts.get("qn_strict", False)) and requested_qn != 0
+        if requested_qn == 0:
+            effective_qn = 64 if sessdata else 32
+            qn_name = BilibiliParser._get_qn_name(effective_qn)
+            BilibiliParser._logger.info(f"清晰度配置: 自动({qn_name}) (qn=0)")
+        else:
+            effective_qn = requested_qn
+            qn_name = BilibiliParser._get_qn_name(requested_qn)
+            if requested_qn not in BilibiliParser.QN_INFO:
+                validation_result["warnings"].append(f"qn={requested_qn} 不在常见清晰度列表，可能无效")
+            BilibiliParser._logger.info(f"清晰度配置: {qn_name} (qn={requested_qn}, strict={strict_qn})")
+
+        if effective_qn >= 64 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}清晰度但未配置Cookie，可能失败")
+        if effective_qn >= 80 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}清晰度需要大会员账号")
+        if effective_qn >= 116 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}高帧率需要大会员账号")
+        if effective_qn >= 125 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}需要大会员账号")
         
         # 检查其他配置（使用硬编码值）
         fnval = 4048  # 硬编码值
@@ -1234,11 +1535,12 @@ class BilibiliWbiSigner:
     
     _logger = get_logger("plugin.bilibili_video_sender.wbi_signer")
 
+    # WBI mixin key 索引表（官方 WBI 签名，长度 64）
     _mixin_key_indices: List[int] = [
         46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
         27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
-        37, 48, 40, 17, 16, 7, 24, 55, 54, 4, 52, 30, 26, 22, 44, 0,
-        1, 34, 25, 6, 51, 11, 36, 20, 21,
+        37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+        22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
     ]
 
     _cached_mixin_key: Optional[str] = None
@@ -1267,6 +1569,9 @@ class BilibiliWbiSigner:
             return cls._cached_mixin_key
         img_key, sub_key = cls._fetch_wbi_keys()
         raw = (img_key + sub_key)
+        if len(raw) < 64:
+            cls._logger.warning(f"WBI key length insufficient: {len(raw)}")
+            raise ValueError("WBI key length insufficient")
         mixed = ''.join(raw[i] for i in cls._mixin_key_indices)[:32]
         cls._cached_mixin_key = mixed
         cls._cached_at = now
@@ -1298,12 +1603,28 @@ class BilibiliWbiSigner:
 
 class BilibiliAutoSendHandler(BaseEventHandler):
     """收到包含哔哩哔哩视频链接的消息后，自动解析并发送视频。"""
-    
+
     _logger = get_logger("plugin.bilibili_video_sender.handler")
 
     event_type = EventType.ON_MESSAGE
     handler_name = "bilibili_auto_send_handler"
     handler_description = "解析B站视频链接并发送视频"
+    intercept_message = False
+
+    def set_plugin_config(self, plugin_config: Dict) -> None:
+        """设置插件配置并根据配置决定是否拦截消息链路"""
+        super().set_plugin_config(plugin_config)
+        # 仅在需要阻止 AI 回复时启用拦截，避免不必要的同步阻塞
+        self.intercept_message = bool(self.get_config("bilibili.block_ai_reply", False))
+
+    # 说明：
+    # 1) MaiBot 文档里仅对 Command 组件明确说明“第三个 bool 可阻止后续处理”；
+    #    EventHandler 的阻断条件在文档中并未写清楚。
+    # 2) 根据 MaiBot 核心实现（events_manager.py）：只有 intercept_message=True 的
+    #    EventHandler 才会同步执行，并使用 execute() 返回值里的 continue_processing
+    #    来控制是否继续后续链路；否则为异步执行，continue_processing 会被忽略。
+    # 3) 本插件在 block_ai_reply=True 时才启用拦截模式，以便在识别到 B 站链接后
+    #    返回 continue_processing=False 来阻止后续 AI 回复；未识别到链接则返回 True 放行。
 
     def _should_return_5_tuple(self) -> bool:
         """判断是否应该返回5元组（基于events_manager版本）
@@ -1311,8 +1632,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         Returns:
             bool: True表示返回5元组，False表示返回3元组
         """
-        # 默认为 False（旧版本），向后兼容
-        return self.get_config("plugin.use_new_events_manager", False)
+        # 默认与配置项一致（新版 events_manager）
+        return self.get_config("plugin.use_new_events_manager", True)
     
     def _make_return_value(self, success: bool, continue_processing: bool, result: str | None) -> Tuple:
         """根据版本配置生成返回值
@@ -1438,7 +1759,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
     async def _send_text(self, content: str, stream_id: str) -> bool:
         """发送文本消息"""
         try:
-            return await send_api.text_to_stream(content, stream_id)
+            store_text = bool(self.get_config("bilibili.store_plugin_text", True))
+            return await send_api.text_to_stream(content, stream_id, storage_message=store_text)
         except Exception as e:
             # 记录错误但不抛出异常，避免影响其他处理器
             return False
@@ -1455,7 +1777,12 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         try:
             # 获取配置的端口
             port = self.get_config("api.port", 5700)
-            api_url = f"http://localhost:{port}/send_private_msg"
+            host = self.get_config("api.host", "napcat")
+            token = str(self.get_config("api.token", "")).strip()
+
+            api_url = f"http://{host}:{port}/send_private_msg"   # 群聊就用 send_group_msg
+
+
             
             # 检查文件是否存在（使用原始路径）
             if not os.path.exists(original_path):
@@ -1463,7 +1790,9 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 return False
             
             # 构造本地文件路径，使用file://协议（使用转换后路径）
-            file_uri = f"file://{converted_path}"
+            file_uri = converted_path
+            if not converted_path.startswith(("http://", "https://", "file://")):
+                file_uri = "file:///" + urllib.request.pathname2url(converted_path).lstrip("/")
             
             self._logger.debug(f"Private video send - original path: {original_path}")
             self._logger.debug(f"Private video send - converted path: {converted_path}")
@@ -1484,18 +1813,36 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             
             self._logger.debug(f"Sending private video API request: {api_url}")
             self._logger.debug(f"Request data: {request_data}")
-            
+            # 构建请求头（必要时携带 Token）
+            headers = {}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
             # 发送API请求
             async with aiohttp.ClientSession() as session:
-                async with session.post(api_url, json=request_data, timeout=300) as response:
+                async with session.post(api_url, json=request_data, headers=headers, timeout=300) as response:
                     if response.status == 200:
                         result = await response.json()
                         self._logger.debug(f"Private video sent successfully: {result}")
                         return True
-                    else:
+                    if response.status in (401, 403) and token:
                         error_text = await response.text()
-                        self._logger.error(f"Failed to send private video: HTTP {response.status}, {error_text}")
-                        return False
+                        self._logger.warning(
+                            f"Private video auth failed ({response.status}), retrying with access_token"
+                        )
+                        retry_url = f"{api_url}?access_token={urllib.parse.quote(token)}"
+                        async with session.post(retry_url, json=request_data, headers=headers, timeout=300) as retry_response:
+                            if retry_response.status == 200:
+                                result = await retry_response.json()
+                                self._logger.debug(f"Private video sent successfully (retry): {result}")
+                                return True
+                            error_text = await retry_response.text()
+                            self._logger.error(
+                                f"Failed to send private video (retry): HTTP {retry_response.status}, {error_text}"
+                            )
+                            return False
+                    error_text = await response.text()
+                    self._logger.error(f"Failed to send private video: HTTP {response.status}, {error_text}")
+                    return False
                         
         except asyncio.TimeoutError:
             self._logger.error("Private video sending timeout")
@@ -1516,7 +1863,12 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         try:
             # 获取配置的端口
             port = self.get_config("api.port", 5700)
-            api_url = f"http://localhost:{port}/send_group_msg"
+            host = self.get_config("api.host", "napcat")
+            token = str(self.get_config("api.token", "")).strip()
+
+            api_url = f"http://{host}:{port}/send_group_msg"   # 群聊就用 send_group_msg
+
+
             
             # 检查文件是否存在（使用原始路径）
             if not os.path.exists(original_path):
@@ -1524,7 +1876,9 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 return False
             
             # 构造本地文件路径，使用file://协议（使用转换后路径）
-            file_uri = f"file://{converted_path}"
+            file_uri = converted_path
+            if not converted_path.startswith(("http://", "https://", "file://")):
+                file_uri = "file:///" + urllib.request.pathname2url(converted_path).lstrip("/")
             
             self._logger.debug(f"Group video send - original path: {original_path}")
             self._logger.debug(f"Group video send - converted path: {converted_path}")
@@ -1545,18 +1899,36 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             
             self._logger.debug(f"Sending group video API request: {api_url}")
             self._logger.debug(f"Request data: {request_data}")
-            
+            # 构建请求头（必要时携带 Token）
+            headers = {}
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
             # 发送API请求
             async with aiohttp.ClientSession() as session:
-                async with session.post(api_url, json=request_data, timeout=300) as response:
+                async with session.post(api_url, json=request_data, headers=headers, timeout=300) as response:
                     if response.status == 200:
                         result = await response.json()
                         self._logger.debug(f"Group video sent successfully: {result}")
                         return True
-                    else:
+                    if response.status in (401, 403) and token:
                         error_text = await response.text()
-                        self._logger.error(f"Failed to send group video: HTTP {response.status}, {error_text}")
-                        return False
+                        self._logger.warning(
+                            f"Group video auth failed ({response.status}), retrying with access_token"
+                        )
+                        retry_url = f"{api_url}?access_token={urllib.parse.quote(token)}"
+                        async with session.post(retry_url, json=request_data, headers=headers, timeout=300) as retry_response:
+                            if retry_response.status == 200:
+                                result = await retry_response.json()
+                                self._logger.debug(f"Group video sent successfully (retry): {result}")
+                                return True
+                            error_text = await retry_response.text()
+                            self._logger.error(
+                                f"Failed to send group video (retry): HTTP {retry_response.status}, {error_text}"
+                            )
+                            return False
+                    error_text = await response.text()
+                    self._logger.error(f"Failed to send group video: HTTP {response.status}, {error_text}")
+                    return False
                         
         except asyncio.TimeoutError:
             self._logger.error("Group video sending timeout")
@@ -1566,562 +1938,655 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             return False
 
     async def execute(self, message: MaiMessages) -> Tuple[bool, bool, str | None]:
-        
+
         if not self.get_config("plugin.enabled", True):
             self._logger.debug("插件已禁用，退出处理")
             return self._make_return_value(True, True, None)
 
         raw: str = getattr(message, "raw_message", "") or ""
-        
+
         url = BilibiliParser.find_first_bilibili_url(raw)
         if not url:
             return self._make_return_value(True, True, None)
-        
+
         self._logger.info("Bilibili video link detected", url=url)
+        # 检测到视频链接后，是否阻止后续 AI 回复
+        block_ai_reply = self.get_config("bilibili.block_ai_reply", False)
+        continue_processing = not block_ai_reply
 
         # 获取stream_id用于发送消息
         stream_id = self._get_stream_id(message)
         if not stream_id:
             self._logger.error("无法获取聊天流ID，尝试备选方案")
-            
+
             # 备选方案：尝试从message_base_info提取用户信息，直接向用户发送消息
             try:
                 from src.chat.message_receive.chat_stream import get_chat_manager
-                
+
                 # 尝试提取平台和用户ID
                 platform = None
                 user_id = None
-                
+
                 # 从message_base_info中提取
                 if message.message_base_info:
                     platform = message.message_base_info.get("platform")
                     user_id = message.message_base_info.get("user_id")
-                
+
                 # 从additional_data中提取
                 if not platform and not user_id and message.additional_data:
                     platform = message.additional_data.get("platform")
                     user_id = message.additional_data.get("user_id")
-                
+
                 if platform and user_id:
                     # 创建一个临时的stream_id
                     chat_manager = get_chat_manager()
                     stream_id = chat_manager.get_stream_id(platform, user_id, False)
                 else:
                     self._logger.error("备选方案失败：无法获取平台和用户ID")
-                    return self._make_return_value(True, True, "无法获取聊天流ID")
+                    return self._make_return_value(True, continue_processing, "无法获取聊天流ID")
             except Exception as e:
                 self._logger.error(f"备选方案失败：{e}")
-                return self._make_return_value(True, True, "无法获取聊天流ID")
-        
+                return self._make_return_value(True, continue_processing, "无法获取聊天流ID")
 
-
-        # （原有的FFmpeg同步检查已移除，改为在后台初始化缓存）
-
-        # 读取并记录配置
-        config_opts = {
-            # 硬编码配置项
-            "use_wbi": True,
-            "prefer_dash": True,
-            "fnval": 4048,
-            "fourk": False,
-            "qn": 0,
-            "platform": "pc",
-            "high_quality": False,
-            "try_look": False,
-            # 从配置文件读取的配置项
-            "sessdata": self.get_config("bilibili.sessdata", ""),
-            "buvid3": self.get_config("bilibili.buvid3", ""),
-        }
-        
-        # 检查鉴权配置
-        if not config_opts['sessdata']:
-            self._logger.debug("No SESSDATA configured, using guest mode")
-            if config_opts['qn'] >= 64:
-                self._logger.warning(f"Requested quality {config_opts['qn']} but not logged in, may fail")
-        if not config_opts['buvid3']:
-            self._logger.debug("No Buvid3 configured, session generation may fail")
-            
-        # 执行配置验证
-        validation_result = BilibiliParser.validate_config(config_opts)
-        if not validation_result["valid"]:
-            self._logger.error("配置验证失败，但继续尝试处理")
-        if validation_result["warnings"]:
-            for warning in validation_result["warnings"]:
-                self._logger.debug(f"配置警告: {warning}")
-        if validation_result["recommendations"]:
-            for rec in validation_result["recommendations"]:
-                self._logger.debug(f"配置建议: {rec}")
-
-        loop = asyncio.get_running_loop()
-
-        def _blocking() -> Optional[Tuple[BilibiliVideoInfo, List[str], str]]:
-            # 在后台线程处理短链接跳转
-            target_url = url
-            if "b23.tv" in target_url:
-                try:
-                    self._logger.debug(f"Resolving short link: {target_url}")
-                    target_url = BilibiliParser._follow_redirect(target_url)
-                    self._logger.debug(f"Resolved to: {target_url}")
-                except Exception as e:
-                    self._logger.warning(f"Failed to resolve short link: {e}")
-            
-            # 同时也在这里检查FFmpeg可用性（第一次检查比较慢，因为要扫描硬件）
-            if not _ffmpeg_manager._cached_check_result:
-                self._logger.debug("Initializing FFmpeg manager cache in background...")
-                _ffmpeg_manager.check_ffmpeg_availability()
-                
-            info = BilibiliParser.get_view_info_by_url(target_url)
-            if not info:
-                self._logger.error("Failed to parse video info", url=target_url)
-                return None
-                
-            self._logger.debug("Video info parsed", title=info.title, aid=info.aid, cid=info.cid)
-            
-            urls, status = BilibiliParser.get_play_urls(info.aid, info.cid, config_opts)
-            self._logger.debug("Playback URLs fetched", status=status, url_count=len(urls), title=info.title)
-                    
-            return info, urls, status
-
-        try:
-            result = await loop.run_in_executor(None, _blocking)
-        except Exception as exc:  # noqa: BLE001 - 简要兜底
-            error_msg = f"解析失败：{exc}"
-            self._logger.error(error_msg)
-            await self._send_text(error_msg, stream_id)
-            return self._make_return_value(True, True, "解析失败")
-
-        if not result:
-            error_msg = "未能解析该视频链接，请稍后重试。"
-            self._logger.error(error_msg)
-            await self._send_text(error_msg, stream_id)
-            return self._make_return_value(True, True, "解析失败")
-
-        info, urls, status = result
-        if not urls:
-            error_msg = f"解析失败：{status}"
-            self._logger.error(error_msg)
-            await self._send_text(error_msg, stream_id)
-            return self._make_return_value(True, True, "解析失败")
-
-        self._logger.info(f"Parse successful: {info.title}")
-
-        # 早期时长校验 (使用 API 返回的时长)
-        enable_duration_limit = self.get_config("bilibili.enable_duration_limit", True)
-        max_video_duration = self.get_config("bilibili.max_video_duration", 600)
-        
-        if enable_duration_limit and info.duration is not None:
-            if info.duration > max_video_duration:
-                duration_minutes = int(info.duration // 60)
-                duration_seconds = int(info.duration % 60)
-                max_minutes = int(max_video_duration // 60)
-                max_seconds = int(max_video_duration % 60)
-                
-                error_msg = f"视频时长超过限制：视频时长为 {duration_minutes}分{duration_seconds}秒，最大允许时长为 {max_minutes}分{max_seconds}秒，已通过在线API检测并拒绝下载。"
-                self._logger.warning(f"Video duration (API) exceeds limit: {info.duration}s > {max_video_duration}s")
-                await self._send_text(error_msg, stream_id)
-                return self._make_return_value(True, True, "视频时长超过限制(API)")
-            else:
-                self._logger.debug(f"Early duration check passed (API): {info.duration}s <= {max_video_duration}s")
-
-        # 发送解析成功消息
-        await self._send_text("解析成功", stream_id)
-        
-        # 现在获取FFmpeg信息（应该是瞬间完成，因为_blocking已经在后台初始化了缓存）
-        ffmpeg_info = _ffmpeg_manager.check_ffmpeg_availability()
-        
-        # 显示警告（如果需要）
-        show_ffmpeg_warnings = self.get_config("ffmpeg.show_warnings", True)
-        if show_ffmpeg_warnings:
-            if not ffmpeg_info["ffmpeg_available"]:
-                self._logger.debug("FFmpeg unavailable, merge functions disabled")
-            if not ffmpeg_info["ffprobe_available"]:
-                self._logger.debug("ffprobe unavailable, duration detection disabled")
-
-        # 同时发送视频文件
-        self._logger.debug("Starting video download...")
-        def _download_to_temp(urls: List[str]) -> Optional[str]:
+        async def _process_video() -> Tuple[bool, bool, str | None]:
             try:
-                
-                safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", info.title).strip() or "bilibili_video"
-                tmp_dir = tempfile.gettempdir()
-                temp_path = os.path.join(tmp_dir, f"{safe_title}.mp4")
-                
-                self._logger.debug("Preparing download", title=info.title, temp_path=temp_path)
-                
-                # 添加特定的请求头来解决403问题
-                # 请求头（含可选 Cookie）
-                headers = {
-                    "User-Agent": BilibiliParser.USER_AGENT,
-                    "Referer": "https://www.bilibili.com/",
-                    "Origin": "https://www.bilibili.com",
-                    "Accept": "*/*",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "Range": "bytes=0-"  # 支持断点续传
+                # （原有的FFmpeg同步检查已移除，改为在后台初始化缓存）
+
+                # 读取并记录配置
+                config_opts = {
+                    # 硬编码配置项
+                    "use_wbi": True,
+                    "prefer_dash": True,
+                    "fnval": 4048,
+                    "fourk": False,
+                    "qn": BilibiliParser._safe_int(self.get_config("bilibili.qn", 0)),
+                    "qn_strict": self.get_config("bilibili.qn_strict", False),
+                    "platform": "pc",
+                    "high_quality": False,
+                    "try_look": False,
+                    # 从配置文件读取的配置项
+                    "sessdata": self.get_config("bilibili.sessdata", ""),
+                    "buvid3": self.get_config("bilibili.buvid3", ""),
                 }
-                sessdata_hdr = self.get_config("bilibili.sessdata", "").strip()
-                buvid3_hdr = self.get_config("bilibili.buvid3", "").strip()
-                if sessdata_hdr:
-                    cookie_parts = [f"SESSDATA={sessdata_hdr}"]
-                    if buvid3_hdr:
-                        cookie_parts.append(f"buvid3={buvid3_hdr}")
-                    headers["Cookie"] = "; ".join(cookie_parts)
-                    headers["gaia_source"] = sessdata_hdr  # 添加 gaia_source
-                    self._logger.debug("Cookie auth added for download")
-                else:
-                    self._logger.debug("No Cookie for download, may get 403 error")
-                
-                # 判断是否是分离的视频和音频流
-                # 注意：这里使用外层的urls变量，需要确保在正确的作用域中调用
-                if len(urls) >= 2 and (".m4s" in urls[0].lower() or ".m4s" in urls[1].lower()):
-                    self._logger.debug("DASH format detected", stream_count=len(urls), format="m4s")
-                    
-                    # 下载视频流
-                    video_temp = os.path.join(tmp_dir, f"{safe_title}_video.m4s")
 
-                    req = BilibiliParser._build_request(urls[0], headers)
-                    with urllib.request.urlopen(req, timeout=60) as resp:
-                        # 获取文件总大小（如果可用）
-                        total_size = resp.headers.get('content-length')
-                        total_size = int(total_size) if total_size else 0
-                        
-                        # 创建进度条
-                        progress_bar = ProgressBar(total_size, "Video stream downloading", 30)
-                        
-                        with open(video_temp, "wb") as f:
-                            downloaded = 0
-                            while True:
-                                chunk = resp.read(1024 * 256)
-                                if not chunk:
-                                    break
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                                # 使用进度条显示进度
-                                progress_bar.update(downloaded)
-                        
-                        # 完成进度条显示
-                        progress_bar.finish()
-                        video_size_mb = os.path.getsize(video_temp) / (1024 * 1024)
-                        self._logger.debug("Video stream downloaded", size_mb=f"{video_size_mb:.2f}")
-                    
-                    # 下载音频流
-                    audio_temp = os.path.join(tmp_dir, f"{safe_title}_audio.m4s")
-                    
-                    # 如果有音频URL，下载音频流
-                    if len(urls) >= 2:
+                # 检查鉴权配置
+                if not config_opts["sessdata"]:
+                    self._logger.debug("No SESSDATA configured, using guest mode")
+                    if config_opts["qn"] >= 64 and config_opts["qn"] != 0:
+                        self._logger.warning(f"Requested quality {config_opts['qn']} but not logged in, may fail")
+                if not config_opts["buvid3"]:
+                    self._logger.debug("No Buvid3 configured, session generation may fail")
 
-                        req = BilibiliParser._build_request(urls[1], headers)
-                        with urllib.request.urlopen(req, timeout=60) as resp:
-                            # 获取文件总大小（如果可用）
-                            total_size = resp.headers.get('content-length')
-                            total_size = int(total_size) if total_size else 0
-                            
-                            # 创建进度条
-                            progress_bar = ProgressBar(total_size, "Audio stream downloading", 30)
-                            
-                            with open(audio_temp, "wb") as f:
-                                downloaded = 0
-                                while True:
-                                    chunk = resp.read(1024 * 256)
-                                    if not chunk:
-                                        break
-                                    f.write(chunk)
-                                    downloaded += len(chunk)
-                                    # 使用进度条显示进度
-                                    progress_bar.update(downloaded)
-                            
-                            # 完成进度条显示
-                            progress_bar.finish()
-                            self._logger.debug(f"Audio stream downloaded, size: {os.path.getsize(audio_temp) // (1024 * 1024)}MB")
-                    else:
-                        self._logger.debug("No audio stream URL available")
-                        audio_temp = None
-                    
-                    # 尝试使用FFmpeg合并
-                    try:
-                        import subprocess
-                        import shutil
+                # 执行配置验证
+                validation_result = BilibiliParser.validate_config(config_opts)
+                if not validation_result["valid"]:
+                    self._logger.error("配置验证失败，但继续尝试处理")
+                if validation_result["warnings"]:
+                    for warning in validation_result["warnings"]:
+                        self._logger.debug(f"配置警告: {warning}")
+                if validation_result["recommendations"]:
+                    for rec in validation_result["recommendations"]:
+                        self._logger.debug(f"配置建议: {rec}")
 
-                        # 使用跨平台FFmpeg管理器获取ffmpeg路径
-                        ffmpeg_path = _ffmpeg_manager.get_ffmpeg_path()
-                        if ffmpeg_path:
-                            self._logger.debug(f"Using FFmpeg: {ffmpeg_path}")
-                            # 首先检查视频文件格式
-                            self._logger.debug("Checking file format...")
-                            
-                            # 检查视频文件 - 使用跨平台ffprobe
-                            ffprobe_path = _ffmpeg_manager.get_ffprobe_path()
-                            if ffprobe_path:
-                                probe_cmd = [ffprobe_path, '-v', 'error', '-show_entries', 'format=format_name', '-of', 'default=noprint_wrappers=1:nokey=1', video_temp]
-                                try:
-                                    video_format = subprocess.run(probe_cmd, capture_output=True, text=False).stdout.decode('utf-8', errors='replace').strip()
-                                except Exception as e:
-                                    self._logger.warning(f"Unable to check video format: {str(e)}")
-                                    video_format = "unknown"
-                                    
-                                # 如果有音频文件，检查其格式
-                                audio_format = "none"
-                                if audio_temp and os.path.exists(audio_temp):
-                                    probe_cmd = [ffprobe_path, '-v', 'error', '-show_entries', 'format=format_name', '-of', 'default=noprint_wrappers=1:nokey=1', audio_temp]
-                                    try:
-                                        audio_format = subprocess.run(probe_cmd, capture_output=True, text=False).stdout.decode('utf-8', errors='replace').strip()
-                                    except Exception as e:
-                                        self._logger.warning(f"Unable to check audio format: {str(e)}")
-                            else:
-                                self._logger.warning(f"ffprobe not found, unable to check file format: {ffprobe_path}")
-                                video_format = "unknown"
-                                audio_format = "none"
-                            
-                            # 根据文件格式决定处理方式
-                            if 'm4s' in video_format.lower() or video_temp.lower().endswith('.m4s'):
-                                # 对于m4s格式，需要添加特殊参数
-                                if audio_temp and os.path.exists(audio_temp):
-                                    ffmpeg_cmd = [
-                                        ffmpeg_path, 
-                                        '-i', video_temp, 
-                                        '-i', audio_temp, 
-                                        '-c:v', 'copy',  # 复制视频流，不重新编码
-                                        '-c:a', 'aac',   # 将音频转换为aac格式以确保兼容性
-                                        '-strict', 'experimental',
-                                        '-b:a', '192k',  # 设置音频比特率
-                                        '-y', temp_path
-                                    ]
-                                else:
-                                    # 如果没有音频文件，只处理视频
-                                    ffmpeg_cmd = [
-                                        ffmpeg_path, 
-                                        '-i', video_temp, 
-                                        '-c:v', 'copy',
-                                        '-y', temp_path
-                                    ]
-                            else:
-                                # 标准处理方式
-                                if audio_temp and os.path.exists(audio_temp):
-                                    ffmpeg_cmd = [
-                                        ffmpeg_path, 
-                                        '-i', video_temp, 
-                                        '-i', audio_temp, 
-                                        '-c:v', 'copy', 
-                                        '-c:a', 'copy', 
-                                        '-y', temp_path
-                                    ]
-                                else:
-                                    # 如果没有音频文件，只处理视频
-                                    ffmpeg_cmd = [
-                                        ffmpeg_path, 
-                                        '-i', video_temp, 
-                                        '-c:v', 'copy',
-                                        '-y', temp_path
-                                    ]
-                            
-                            self._logger.debug("Starting to merge video and audio...")
-                            
-                            # 使用正确的编码设置来避免Windows上的编码问题
-                            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=False)
-                            
-                            if result.returncode == 0:
-                                self._logger.debug("Video and audio merged successfully")
-                                # 删除临时文件
-                                try:
-                                    if os.path.exists(video_temp):
-                                        os.remove(video_temp)
-                                    if audio_temp and os.path.exists(audio_temp):
-                                        os.remove(audio_temp)
-                                    self._logger.debug("Temporary files cleaned")
-                                except Exception as e:
-                                    self._logger.warning(f"Failed to clean temp: {str(e)}")
-                                    
-                                return temp_path
-                            else:
-                                stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
-                                self._logger.warning(f"FFmpeg merge failed: {stderr_text}")
-                        else:
-                            self._logger.warning("FFmpeg not found, cannot merge video and audio")
-                            self._logger.debug("Using video stream only")
-                    except Exception as e:
-                        self._logger.warning(f"Merge failed: {str(e)}")
-                    
-                    # 如果所有方法都失败，返回视频流文件
-                    self._logger.debug("Using video stream only")
-                    return video_temp
-                
-                # 非分离流：仅支持DASH，跳过单文件下载
-                self._logger.debug("Only DASH streams supported, skipping single file download")
-                return None
-            except Exception as e:
-                self._logger.error(f"Failed to download video: {e}")
-                return None
+                loop = asyncio.get_running_loop()
 
-        temp_path = await asyncio.get_running_loop().run_in_executor(None, lambda: _download_to_temp(urls))
-        if not temp_path:
-            self._logger.warning("Video download failed")
-            return self._make_return_value(True, True, "视频下载失败")
+                def _blocking() -> Optional[Tuple[BilibiliVideoInfo, Dict[str, Any], str]]:
+                    # 在后台线程处理短链接跳转
+                    target_url = url
+                    if "b23.tv" in target_url:
+                        try:
+                            self._logger.debug(f"Resolving short link: {target_url}")
+                            target_url = BilibiliParser._follow_redirect(target_url)
+                            self._logger.debug(f"Resolved to: {target_url}")
+                        except Exception as e:
+                            self._logger.warning(f"Failed to resolve short link: {e}")
 
-        self._logger.debug(f"Video download completed: {temp_path}")
-        caption = f"{info.title}"
+                    # 同时也在这里检查FFmpeg可用性（第一次检查比较慢，因为要扫描硬件）
+                    if not _ffmpeg_manager._cached_check_result:
+                        self._logger.debug("Initializing FFmpeg manager cache in background...")
+                        _ffmpeg_manager.check_ffmpeg_availability()
 
-        # 检查视频时长
-        # 检查视频时长 (异步执行，防止阻塞主循环)
-        video_duration = await loop.run_in_executor(None, BilibiliParser.get_video_duration, temp_path)
-        self._logger.debug(f"Detected video duration: {video_duration} seconds")
-        
-        # 检查视频时长限制
-        enable_duration_limit = self.get_config("bilibili.enable_duration_limit", True)
-        max_video_duration = self.get_config("bilibili.max_video_duration", 600)
-        
-        if enable_duration_limit and video_duration is not None:
-            if video_duration > max_video_duration:
-                duration_minutes = int(video_duration // 60)
-                duration_seconds = int(video_duration % 60)
-                max_minutes = int(max_video_duration // 60)
-                max_seconds = int(max_video_duration % 60)
-                
-                error_msg = f"视频时长超过限制：视频时长为 {duration_minutes}分{duration_seconds}秒，最大允许时长为 {max_minutes}分{max_seconds}秒，已拒绝发送。"
-                self._logger.warning(f"Video duration exceeds limit: {video_duration}s > {max_video_duration}s")
-                await self._send_text(error_msg, stream_id)
-                
-                # 清理临时文件 (异步)
+                    info = BilibiliParser.get_view_info_by_url(target_url, config_opts)
+                    if not info:
+                        self._logger.error("Failed to parse video info", url=target_url)
+                        return None
+
+                    self._logger.debug("Video info parsed", title=info.title, aid=info.aid, cid=info.cid)
+
+                    sources, status = BilibiliParser.get_play_urls(info.aid, info.cid, config_opts)
+                    source_type = sources.get("type") if sources else "none"
+                    self._logger.debug("Playback sources fetched", status=status, source_type=source_type, title=info.title)
+
+                    return info, sources, status
+
                 try:
-                    await loop.run_in_executor(None, lambda: os.remove(temp_path) if os.path.exists(temp_path) else None)
-                    self._logger.debug("Temporary video file deleted after duration check failure")
+                    result = await loop.run_in_executor(None, _blocking)
+                except Exception as exc:  # noqa: BLE001 - 简要兜底
+                    error_msg = f"解析失败：{exc}"
+                    self._logger.error(error_msg)
+                    await self._send_text(error_msg, stream_id)
+                    return self._make_return_value(True, continue_processing, "解析失败")
+
+                if not result:
+                    error_msg = "未能解析该视频链接，请稍后重试。"
+                    self._logger.error(error_msg)
+                    await self._send_text(error_msg, stream_id)
+                    return self._make_return_value(True, continue_processing, "解析失败")
+
+                info, sources, status = result
+                if not sources:
+                    error_msg = f"解析失败：{status}"
+                    self._logger.error(error_msg)
+                    await self._send_text(error_msg, stream_id)
+                    return self._make_return_value(True, continue_processing, "解析失败")
+
+                self._logger.info(f"Parse successful: {info.title}")
+
+                # 早期时长校验 (使用 API 返回的时长)
+                enable_duration_limit = self.get_config("bilibili.enable_duration_limit", True)
+                max_video_duration = self.get_config("bilibili.max_video_duration", 600)
+
+                if enable_duration_limit and info.duration is not None:
+                    if info.duration > max_video_duration:
+                        duration_minutes = int(info.duration // 60)
+                        duration_seconds = int(info.duration % 60)
+                        max_minutes = int(max_video_duration // 60)
+                        max_seconds = int(max_video_duration % 60)
+
+                        error_msg = (
+                            f"视频时长超过限制：视频时长为 {duration_minutes}分{duration_seconds}秒，"
+                            f"最大允许时长为 {max_minutes}分{max_seconds}秒，已通过在线API检测并拒绝下载。"
+                        )
+                        self._logger.warning(
+                            f"Video duration (API) exceeds limit: {info.duration}s > {max_video_duration}s"
+                        )
+                        await self._send_text(error_msg, stream_id)
+                        return self._make_return_value(True, continue_processing, "视频时长超过限制(API)")
+                    else:
+                        self._logger.debug(f"Early duration check passed (API): {info.duration}s <= {max_video_duration}s")
+
+                # 发送解析成功消息
+                success_message = "解析成功"
+                selected_qn_name = config_opts.get("selected_qn_name")
+                requested_qn_name = config_opts.get("requested_qn_name")
+                selected_qn = config_opts.get("selected_qn")
+                requested_qn = config_opts.get("requested_qn")
+                if selected_qn_name and selected_qn:
+                    if requested_qn and selected_qn and requested_qn != selected_qn:
+                        success_message = f"解析成功，已选择：{selected_qn_name}（降级自：{requested_qn_name}）"
+                    else:
+                        success_message = f"解析成功，已选择：{selected_qn_name}"
+                await self._send_text(success_message, stream_id)
+
+                # 现在获取FFmpeg信息（应该是瞬间完成，因为_blocking已经在后台初始化了缓存）
+                ffmpeg_info = _ffmpeg_manager.check_ffmpeg_availability()
+
+                # 显示警告（如果需要）
+                show_ffmpeg_warnings = self.get_config("ffmpeg.show_warnings", True)
+                if show_ffmpeg_warnings:
+                    if not ffmpeg_info["ffmpeg_available"]:
+                        self._logger.debug("FFmpeg unavailable, merge functions disabled")
+                    if not ffmpeg_info["ffprobe_available"]:
+                        self._logger.debug("ffprobe unavailable, duration detection disabled")
+
+                # 同时发送视频文件
+                self._logger.debug("Starting video download...")
+                def _download_to_temp(sources: Dict[str, Any]) -> Optional[str]:
+                    try:
+                        # sources 结构：dash -> {video_urls, audio_urls}；durl -> {urls}
+                        # 生成安全的临时文件名，避免特殊字符导致写入失败
+                        safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", info.title).strip() or "bilibili_video"
+                        unique_tag = f"{info.aid}_{info.cid}_{int(time.time() * 1000)}"
+                        base_name = f"{safe_title}_{unique_tag}"
+                        tmp_dir = _get_download_temp_dir()
+                        os.makedirs(tmp_dir, exist_ok=True)
+
+                        temp_path = os.path.join(tmp_dir, f"{base_name}.mp4")
+
+                        self._logger.debug("Preparing download", title=info.title, temp_path=temp_path)
+
+                        # 构建下载请求头（必要时带 Cookie）
+                        headers = {
+                            "User-Agent": BilibiliParser.USER_AGENT,
+                            "Referer": "https://www.bilibili.com/",
+                            "Origin": "https://www.bilibili.com",
+                            "Accept": "*/*",
+                            "Accept-Encoding": "gzip, deflate, br",
+                            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                            "Range": "bytes=0-"  # 支持 Range 请求，避免部分 CDN 403
+                        }
+                        sessdata_hdr = self.get_config("bilibili.sessdata", "").strip()
+                        buvid3_hdr = self.get_config("bilibili.buvid3", "").strip()
+                        if sessdata_hdr:
+                            cookie_parts = [f"SESSDATA={sessdata_hdr}"]
+                            if buvid3_hdr:
+                                cookie_parts.append(f"buvid3={buvid3_hdr}")
+                            headers["Cookie"] = "; ".join(cookie_parts)
+                            self._logger.debug("Cookie auth added for download")
+                        else:
+                            self._logger.debug("No Cookie for download, may get 403 error")
+
+                        # 下载单条流，支持多 URL 自动切换（主链失败时自动切备链）
+                        def _download_stream(url_list: List[str], save_path: str, desc: str) -> bool:
+                            if not url_list:
+                                return False
+                            last_err = None
+                            for idx, url in enumerate(url_list, start=1):
+                                try:
+                                    req = BilibiliParser._build_request(url, headers)
+                                    with urllib.request.urlopen(req, timeout=60) as resp:
+                                        # 获取文件总大小（如果可用）
+                                        total_size = resp.headers.get("content-length")
+                                        total_size = int(total_size) if total_size else 0
+
+                                        # 创建进度条
+                                        progress_bar = ProgressBar(total_size, f"{desc} (候选{idx}/{len(url_list)})", 30)
+                                        with open(save_path, "wb") as f:
+                                            downloaded = 0
+                                            while True:
+                                                chunk = resp.read(1024 * 256)
+                                                if not chunk:
+                                                    break
+                                                f.write(chunk)
+                                                downloaded += len(chunk)
+                                                # 使用进度条显示进度
+                                                progress_bar.update(downloaded)
+
+                                        # 完成进度条显示
+                                        progress_bar.finish()
+                                        if total_size > 0 and downloaded < total_size:
+                                            raise IOError(f"下载不完整: {downloaded}/{total_size}")
+                                    return True
+                                except Exception as e:
+                                    last_err = e
+                                    self._logger.warning(f"{desc} 第{idx}条链接下载失败: {e}")
+                                    try:
+                                        if os.path.exists(save_path):
+                                            os.remove(save_path)
+                                    except Exception:
+                                        pass
+                            if last_err:
+                                self._logger.error(f"{desc} 所有链接下载失败: {last_err}")
+                            return False
+
+                        source_type = sources.get("type")
+
+                        # DASH：先下载视频流，再尝试下载音频流
+                        if source_type == "dash":
+                            video_urls = sources.get("video_urls") or []
+                            audio_urls = sources.get("audio_urls") or []
+
+                            self._logger.debug("DASH format assumed", video_urls=len(video_urls), audio_urls=len(audio_urls))
+
+                            video_temp = os.path.join(tmp_dir, f"{base_name}_video.m4s")
+                            if not _download_stream(video_urls, video_temp, "Video stream downloading"):
+                                return None
+
+                            audio_temp = None
+                            if audio_urls:
+                                audio_temp = os.path.join(tmp_dir, f"{base_name}_audio.m4s")
+                                if not _download_stream(audio_urls, audio_temp, "Audio stream downloading"):
+                                    self._logger.warning("Audio stream download failed, continue with video only")
+                                    audio_temp = None
+
+                            # 尝试使用 FFmpeg 合并音视频
+                            try:
+                                ffmpeg_path = _ffmpeg_manager.get_ffmpeg_path()
+                                if ffmpeg_path:
+                                    self._logger.debug(f"Using FFmpeg: {ffmpeg_path}")
+                                    ffprobe_path = _ffmpeg_manager.get_ffprobe_path()
+                                    video_format = "unknown"
+                                    audio_format = "none"
+                                    if ffprobe_path:
+                                        probe_cmd = [
+                                            ffprobe_path,
+                                            "-v", "error",
+                                            "-show_entries", "format=format_name",
+                                            "-of", "default=noprint_wrappers=1:nokey=1",
+                                            video_temp
+                                        ]
+                                        try:
+                                            video_format = subprocess.run(
+                                                probe_cmd, capture_output=True, text=False
+                                            ).stdout.decode("utf-8", errors="replace").strip()
+                                        except Exception as e:
+                                            self._logger.warning(f"Unable to check video format: {str(e)}")
+                                        if audio_temp and os.path.exists(audio_temp):
+                                            probe_cmd = [
+                                                ffprobe_path,
+                                                "-v", "error",
+                                                "-show_entries", "format=format_name",
+                                                "-of", "default=noprint_wrappers=1:nokey=1",
+                                                audio_temp
+                                            ]
+                                            try:
+                                                audio_format = subprocess.run(
+                                                    probe_cmd, capture_output=True, text=False
+                                                ).stdout.decode("utf-8", errors="replace").strip()
+                                            except Exception as e:
+                                                self._logger.warning(f"Unable to check audio format: {str(e)}")
+                                    else:
+                                        self._logger.warning(f"ffprobe not found, unable to check file format: {ffprobe_path}")
+
+                                    if "m4s" in video_format.lower() or video_temp.lower().endswith(".m4s"):
+                                        if audio_temp and os.path.exists(audio_temp):
+                                            ffmpeg_cmd = [
+                                                ffmpeg_path,
+                                                "-i", video_temp,
+                                                "-i", audio_temp,
+                                                "-c:v", "copy",  # 复制视频流，不重新编码
+                                                "-c:a", "aac",   # 将音频转换为aac格式以确保兼容性
+                                                "-strict", "experimental",
+                                                "-b:a", "192k",  # 设置音频比特率
+                                                "-y", temp_path
+                                            ]
+                                        else:
+                                            ffmpeg_cmd = [ffmpeg_path, "-i", video_temp, "-c:v", "copy", "-y", temp_path]
+                                    else:
+                                        if audio_temp and os.path.exists(audio_temp):
+                                            ffmpeg_cmd = [
+                                                ffmpeg_path,
+                                                "-i", video_temp,
+                                                "-i", audio_temp,
+                                                "-c:v", "copy",
+                                                "-c:a", "copy",
+                                                "-y", temp_path
+                                            ]
+                                        else:
+                                            ffmpeg_cmd = [ffmpeg_path, "-i", video_temp, "-c:v", "copy", "-y", temp_path]
+
+                                    self._logger.debug("Starting to merge video and audio...")
+                                    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=False)
+                                    if result.returncode == 0:
+                                        self._logger.debug("Video and audio merged successfully")
+                                        try:
+                                            if os.path.exists(video_temp):
+                                                os.remove(video_temp)
+                                            if audio_temp and os.path.exists(audio_temp):
+                                                os.remove(audio_temp)
+                                            self._logger.debug("Temporary files cleaned")
+                                        except Exception as e:
+                                            self._logger.warning(f"Failed to clean temp: {str(e)}")
+                                        return temp_path
+                                    else:
+                                        stderr_text = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+                                        self._logger.warning(f"FFmpeg merge failed: {stderr_text}")
+                                        # 合并失败时退化为仅视频转封装，避免发送 m4s
+                                        fallback_cmd = [ffmpeg_path, "-i", video_temp, "-c", "copy", "-y", temp_path]
+                                        fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=False)
+                                        if fallback_result.returncode == 0:
+                                            self._logger.warning("Audio merge failed, fallback to video-only mp4")
+                                            try:
+                                                if os.path.exists(video_temp):
+                                                    os.remove(video_temp)
+                                                if audio_temp and os.path.exists(audio_temp):
+                                                    os.remove(audio_temp)
+                                            except Exception:
+                                                pass
+                                            return temp_path
+                                        fallback_err = fallback_result.stderr.decode("utf-8", errors="replace") if fallback_result.stderr else ""
+                                        self._logger.warning(f"FFmpeg fallback remux failed: {fallback_err}")
+                                else:
+                                    self._logger.warning("FFmpeg not found, cannot merge video and audio")
+                            except Exception as e:
+                                self._logger.warning(f"Merge failed: {str(e)}")
+
+                            self._logger.warning("DASH 合并失败且无法转封装，放弃发送 m4s")
+                            if audio_temp and os.path.exists(audio_temp):
+                                try:
+                                    os.remove(audio_temp)
+                                except Exception:
+                                    pass
+                            if os.path.exists(video_temp):
+                                try:
+                                    os.remove(video_temp)
+                                except Exception:
+                                    pass
+                            return None
+
+                        # durl：单文件直链下载（可能带备链）
+                        if source_type == "durl":
+                            url_list = sources.get("urls") or []
+                            if not url_list:
+                                return None
+                            parsed_path = urllib.parse.urlparse(url_list[0]).path
+                            ext = os.path.splitext(parsed_path)[1].lower()
+                            download_path = temp_path
+                            if ext and ext != ".mp4":
+                                download_path = os.path.join(tmp_dir, f"{base_name}{ext}")
+
+                            self._logger.debug("Single file download", path=download_path)
+                            if not _download_stream(url_list, download_path, "Video downloading"):
+                                return None
+
+                            final_path = download_path
+                            if ext and ext != ".mp4":
+                                ffmpeg_path = _ffmpeg_manager.get_ffmpeg_path()
+                                if ffmpeg_path:
+                                    remux_path = os.path.join(tmp_dir, f"{base_name}.mp4")
+                                    remux_cmd = [ffmpeg_path, "-i", download_path, "-c", "copy", "-y", remux_path]
+                                    remux_result = subprocess.run(remux_cmd, capture_output=True, text=False)
+                                    if remux_result.returncode == 0:
+                                        self._logger.debug("Single file remuxed to mp4")
+                                        try:
+                                            os.remove(download_path)
+                                        except Exception:
+                                            pass
+                                        final_path = remux_path
+                                    else:
+                                        stderr_text = remux_result.stderr.decode("utf-8", errors="replace") if remux_result.stderr else ""
+                                        self._logger.warning(f"Single file remux failed: {stderr_text}")
+                                else:
+                                    self._logger.debug("FFmpeg not found, skipping remux")
+
+                            return final_path
+
+                        self._logger.debug("No supported streams found for download")
+                        return None
+                    except Exception as e:
+                        self._logger.error(f"Failed to download video: {e}")
+                        return None
+                temp_path = await asyncio.get_running_loop().run_in_executor(None, lambda: _download_to_temp(sources))
+                if not temp_path:
+                    self._logger.warning("Video download failed")
+                    return self._make_return_value(True, continue_processing, "视频下载失败")
+
+                self._logger.debug(f"Video download completed: {temp_path}")
+                caption = f"{info.title}"
+
+                # 检查视频时长 (异步执行，防止阻塞主循环)
+                video_duration = await loop.run_in_executor(None, BilibiliParser.get_video_duration, temp_path)
+                self._logger.debug(f"Detected video duration: {video_duration} seconds")
+
+                # 检查视频时长限制
+                enable_duration_limit = self.get_config("bilibili.enable_duration_limit", True)
+                max_video_duration = self.get_config("bilibili.max_video_duration", 600)
+
+                if enable_duration_limit and video_duration is not None:
+                    if video_duration > max_video_duration:
+                        duration_minutes = int(video_duration // 60)
+                        duration_seconds = int(video_duration % 60)
+                        max_minutes = int(max_video_duration // 60)
+                        max_seconds = int(max_video_duration % 60)
+
+                        error_msg = (
+                            f"视频时长超过限制：视频时长为 {duration_minutes}分{duration_seconds}秒，"
+                            f"最大允许时长为 {max_minutes}分{max_seconds}秒，已拒绝发送。"
+                        )
+                        self._logger.warning(f"Video duration exceeds limit: {video_duration}s > {max_video_duration}s")
+                        await self._send_text(error_msg, stream_id)
+
+                        # 清理临时文件 (异步)
+                        try:
+                            await loop.run_in_executor(
+                                None, lambda: os.remove(temp_path) if os.path.exists(temp_path) else None
+                            )
+                            self._logger.debug("Temporary video file deleted after duration check failure")
+                        except Exception as e:
+                            self._logger.warning(f"Failed to delete temporary file: {e}")
+
+                        return self._make_return_value(True, continue_processing, "视频时长超过限制")
+                    else:
+                        self._logger.debug(f"Video duration check passed: {video_duration}s <= {max_video_duration}s")
+                elif enable_duration_limit and video_duration is None:
+                    self._logger.warning("Duration limit enabled but ffprobe unavailable, skipping duration check")
+
+                # 检查视频文件大小和时长，决定处理策略 (异步获取大小)
+                try:
+                    video_size_mb = await loop.run_in_executor(
+                        None, lambda: os.path.getsize(temp_path) / (1024 * 1024)
+                    )
+                except Exception:
+                    video_size_mb = 0.0
+
+                self._logger.debug(f"Detected video size: {video_size_mb:.2f}MB")
+
+                # 从配置读取相关设置
+                max_video_size_mb = self.get_config("bilibili.max_video_size_mb", 100)
+                enable_compression = self.get_config("bilibili.enable_video_compression", True)
+                compression_quality = self.get_config("bilibili.compression_quality", 23)
+
+                self._logger.debug(
+                    f"Video processing configuration: compression={enable_compression}, "
+                    f"max size={max_video_size_mb}MB, compression quality={compression_quality}"
+                )
+
+                # 处理单个视频文件
+                final_video_path = temp_path
+
+                # 定义压缩任务函数（在线程池中运行，避免阻塞主进程）
+                def _compress_task() -> Optional[str]:
+                    try:
+                        self._logger.debug(
+                            f"Single video file size ({video_size_mb:.2f}MB) exceeds limit, starting compression..."
+                        )
+
+                        base_name, _ = os.path.splitext(temp_path)
+                        compressed_path = f"{base_name}_compressed.mp4"
+                        # 构建配置字典传递给压缩器
+                        config_dict = {
+                            "ffmpeg": {
+                                "enable_hardware_acceleration": self.get_config(
+                                    "ffmpeg.enable_hardware_acceleration", True
+                                ),
+                                "force_encoder": self.get_config("ffmpeg.force_encoder", ""),
+                                "encoder_priority": self.get_config(
+                                    "ffmpeg.encoder_priority", ["nvidia", "intel", "amd", "apple"]
+                                )
+                            }
+                        }
+                        compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"], config_dict)
+
+                        # 执行压缩（这是最耗时的部分）
+                        if compressor.compress_video(temp_path, compressed_path, max_video_size_mb, compression_quality):
+                            compressed_size_mb = os.path.getsize(compressed_path) / (1024 * 1024)
+                            self._logger.debug(
+                                f"Single video compression successful: {video_size_mb:.2f}MB -> {compressed_size_mb:.2f}MB"
+                            )
+
+                            # 压缩成功后清理原始文件
+                            try:
+                                os.remove(temp_path)
+                                self._logger.debug(f"Original video file {temp_path} deleted")
+                            except Exception as e:
+                                self._logger.warning(f"Failed to delete original video file: {e}")
+
+                            return compressed_path
+                        else:
+                            self._logger.debug("Single video compression failed, using original file")
+                            return None
+                    except Exception as e:
+                        self._logger.error(f"Compression task error: {e}")
+                        return None
+
+                # 如果文件过大且启用压缩，先压缩
+                if (
+                    video_size_mb > max_video_size_mb
+                    and enable_compression
+                    and ffmpeg_info["ffmpeg_available"]
+                ):
+
+                    # 将繁重的压缩任务扔进线程池
+                    compressed_result = await loop.run_in_executor(None, _compress_task)
+
+                    if compressed_result:
+                        final_video_path = compressed_result
+
+                elif video_size_mb > max_video_size_mb:
+                    self._logger.debug(
+                        f"Single video file size ({video_size_mb:.2f}MB) exceeds limit but compression not available"
+                    )
+                else:
+                    self._logger.debug(
+                        f"Single video file size ({video_size_mb:.2f}MB) meets requirements, no compression needed"
+                    )
+
+                # 发送处理后的视频文件
+                async def _try_send(path: str) -> bool:
+                    # 在发送前进行WSL路径转换
+                    enable_conversion = self.get_config("wsl.enable_path_conversion", False)
+                    converted_path = convert_windows_to_wsl_path(path) if enable_conversion else path
+
+                    self._logger.debug(f"Sending single video - path conversion enabled: {enable_conversion}")
+                    self._logger.debug(f"Sending single video - original path: {path}")
+                    self._logger.debug(f"Sending single video - converted path: {converted_path}")
+
+                    # 检查是否为私聊消息
+                    is_private = self._is_private_message(message)
+
+                    if is_private:
+                        # 私聊消息，使用专用API发送
+                        user_id = self._get_user_id(message)
+                        if user_id:
+                            self._logger.debug(f"Private message detected, sending private video API to user: {user_id}")
+                            return await self._send_private_video(path, converted_path, user_id)
+                        else:
+                            self._logger.error("Private message but unable to get user ID")
+                            return False
+                    else:
+                        # 群聊消息，使用群视频API
+                        group_id = self._get_group_id(message)
+                        if group_id:
+                            self._logger.debug(f"Group message detected, sending group video API to group: {group_id}")
+                            return await self._send_group_video(path, converted_path, group_id)
+                        else:
+                            self._logger.error("Group message detected but unable to get group ID, sending failed")
+                            return False
+
+                sent_ok = await _try_send(final_video_path)
+                if not sent_ok:
+                    self._logger.debug("Video sending failed")
+                    await self._send_text("视频解析成功，但发送失败。请检查网络连接和API配置。", stream_id)
+                else:
+                    self._logger.info("Video file sent successfully")
+
+                # 删除临时文件 (异步)
+                try:
+                    def _cleanup():
+                        # 删除最终处理的文件
+                        if os.path.exists(final_video_path):
+                            os.remove(final_video_path)
+                        # 如果还有原始文件且不同于最终文件，也删除
+                        if final_video_path != temp_path and os.path.exists(temp_path):
+                            os.remove(temp_path)
+
+                    await loop.run_in_executor(None, _cleanup)
+                    self._logger.debug("Video files cleaned up")
                 except Exception as e:
                     self._logger.warning(f"Failed to delete temporary file: {e}")
-                
-                return self._make_return_value(True, True, "视频时长超过限制")
-            else:
-                self._logger.debug(f"Video duration check passed: {video_duration}s <= {max_video_duration}s")
-        elif enable_duration_limit and video_duration is None:
-            self._logger.warning("Duration limit enabled but ffprobe unavailable, skipping duration check")
-        
-        # 检查视频文件大小和时长，决定处理策略
-        # 检查视频文件大小和时长，决定处理策略 (异步获取大小)
-        try:
-            video_size_mb = await loop.run_in_executor(None, lambda: os.path.getsize(temp_path) / (1024 * 1024))
-        except Exception:
-            video_size_mb = 0.0
-            
-        self._logger.debug(f"Detected video size: {video_size_mb:.2f}MB")
-        
-        # 从配置读取相关设置
-        max_video_size_mb = self.get_config("bilibili.max_video_size_mb", 100)
-        enable_compression = self.get_config("bilibili.enable_video_compression", True)
-        compression_quality = self.get_config("bilibili.compression_quality", 23)
-        
-        self._logger.debug(f"Video processing configuration: compression={enable_compression}, max size={max_video_size_mb}MB, compression quality={compression_quality}")
-        
-        # 处理单个视频文件
-        final_video_path = temp_path
-        
-        # 定义压缩任务函数（在线程池中运行，避免阻塞主进程）
-        def _compress_task() -> Optional[str]:
-            try:
-                self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) exceeds limit, starting compression...")
-                
-                compressed_path = temp_path.replace('.mp4', '_compressed.mp4')
-                # 构建配置字典传递给压缩器
-                config_dict = {
-                    "ffmpeg": {
-                        "enable_hardware_acceleration": self.get_config("ffmpeg.enable_hardware_acceleration", True),
-                        "force_encoder": self.get_config("ffmpeg.force_encoder", ""),
-                        "encoder_priority": self.get_config("ffmpeg.encoder_priority", ["nvidia", "intel", "amd", "apple"])
-                    }
-                }
-                compressor = VideoCompressor(ffmpeg_info["ffmpeg_path"], config_dict)
-                
-                # 执行压缩（这是最耗时的部分）
-                if compressor.compress_video(temp_path, compressed_path, max_video_size_mb, compression_quality):
-                    compressed_size_mb = os.path.getsize(compressed_path) / (1024 * 1024)
-                    self._logger.debug(f"Single video compression successful: {video_size_mb:.2f}MB -> {compressed_size_mb:.2f}MB")
-                    
-                    # 压缩成功后清理原始文件
-                    try:
-                        os.remove(temp_path)
-                        self._logger.debug(f"Original video file {temp_path} deleted")
-                    except Exception as e:
-                        self._logger.warning(f"Failed to delete original video file: {e}")
-                        
-                    return compressed_path
-                else:
-                    self._logger.debug("Single video compression failed, using original file")
-                    return None
+
+                self._logger.info("Bilibili video processing completed")
+                return self._make_return_value(True, continue_processing, "已发送视频（若宿主支持）")
             except Exception as e:
-                self._logger.error(f"Compression task error: {e}")
-                return None
+                self._logger.error(f"视频处理异常: {e}")
+                return self._make_return_value(True, continue_processing, "解析失败")
 
-        # 如果文件过大且启用压缩，先压缩
-        if (video_size_mb > max_video_size_mb and
-            enable_compression and
-            ffmpeg_info["ffmpeg_available"]):
-            
-            # 将繁重的压缩任务扔进线程池
-            compressed_result = await loop.run_in_executor(None, _compress_task)
-            
-            if compressed_result:
-                final_video_path = compressed_result
-                
-        elif video_size_mb > max_video_size_mb:
-            self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) exceeds limit but compression not available")
-        else:
-            self._logger.debug(f"Single video file size ({video_size_mb:.2f}MB) meets requirements, no compression needed")
-        
-        # 发送处理后的视频文件
-        async def _try_send(path: str) -> bool:
-            # 在发送前进行WSL路径转换
-            enable_conversion = self.get_config("wsl.enable_path_conversion", True)
-            converted_path = convert_windows_to_wsl_path(path) if enable_conversion else path
-            
-            self._logger.debug(f"Sending single video - path conversion enabled: {enable_conversion}")
-            self._logger.debug(f"Sending single video - original path: {path}")
-            self._logger.debug(f"Sending single video - converted path: {converted_path}")
-            
-            # 检查是否为私聊消息
-            is_private = self._is_private_message(message)
-            
-            if is_private:
-                # 私聊消息，使用专用API发送
-                user_id = self._get_user_id(message)
-                if user_id:
-                    self._logger.debug(f"Private message detected, sending private video API to user: {user_id}")
-                    return await self._send_private_video(path, converted_path, user_id)
-                else:
-                    self._logger.error("Private message but unable to get user ID")
-                    return False
-            else:
-                # 群聊消息，使用群视频API
-                group_id = self._get_group_id(message)
-                if group_id:
-                    self._logger.debug(f"Group message detected, sending group video API to group: {group_id}")
-                    return await self._send_group_video(path, converted_path, group_id)
-                else:
-                    self._logger.error("Group message detected but unable to get group ID, sending failed")
-                    return False
+        # block_ai_reply=True 时立即返回，避免阻塞事件链路；后台任务继续处理下载与发送
+        if block_ai_reply:
+            asyncio.create_task(_process_video())
+            return self._make_return_value(True, False, "已接管B站链接处理")
 
-        sent_ok = await _try_send(final_video_path)
-        if not sent_ok:
-            self._logger.debug("Video sending failed")
-            await self._send_text("视频解析成功，但发送失败。请检查网络连接和API配置。", stream_id)
-        else:
-            self._logger.info("Video file sent successfully")
-        
-        # 删除临时文件
-        # 删除临时文件 (异步)
-        try:
-            def _cleanup():
-                # 删除最终处理的文件
-                if os.path.exists(final_video_path):
-                    os.remove(final_video_path)
-                # 如果还有原始文件且不同于最终文件，也删除
-                if final_video_path != temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
-            
-            await loop.run_in_executor(None, _cleanup)
-            self._logger.debug("Video files cleaned up")
-        except Exception as e:
-            self._logger.warning(f"Failed to delete temporary file: {e}")
-        
-        self._logger.info("Bilibili video processing completed")
-        return self._make_return_value(True, True, "已发送视频（若宿主支持）")
-
+        return await _process_video()
 
 @register_plugin
 class BilibiliVideoSenderPlugin(BasePlugin):
@@ -2143,29 +2608,47 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.3.0", description="配置版本"),
-            "use_new_events_manager": ConfigField(type=bool, default=True, description="是否使用新版events_manager（0.10.2及以上版本设为true，否则设为false）"),
+            "config_version": ConfigField(type=str, default="1.3.2", description="配置版本"),
+            "use_new_events_manager": ConfigField(type=bool, default=True, description="是否使用新版 events_manager（0.10.2 及以上版本设为 True，否则设为 False）"),
         },
         "bilibili": {
-            "sessdata": ConfigField(type=str, default="", description="B站登录Cookie中的SESSDATA值（用于获取高清晰度视频）"),
-            "buvid3": ConfigField(type=str, default="", description="B站设备标识Buvid3（用于生成session参数）"),
-            "max_video_size_mb": ConfigField(type=int, default=100, description="视频文件大小限制（MB），超过此大小将进行压缩"),
+            "sessdata": ConfigField(type=str, default="", description="B 站登录 Cookie 中的 SESSDATA 值（用于获取高清晰度视频）"),
+            "buvid3": ConfigField(type=str, default="", description="B 站设备标识 Buvid3（可选，用于生成 session 参数）"),
+            "qn": ConfigField(type=int, default=0, description="清晰度设置(qn)，0 为自动（登录默认 720P，未登录默认 480P）。常见值：16 = 360P, 32 = 480P, 64 = 720P, 74 = 720P60, 80 = 1080P, 112 = 1080P+, 116 = 1080P60, 120 = 4K, 125 = HDR, 126 = 杜比视界, 127 = 8K"),
+            "qn_strict": ConfigField(type=bool, default=False, description="是否严格按 qn 选择清晰度。False 时会在可用流中自动降级/回退；True 时不可用则报错"),
+            "block_ai_reply": ConfigField(type=bool, default=True, description="检测到 B 站视频链接后是否阻止后续 AI 回复（仅影响本次事件链路）（旧版 events_manager 下可能无效）"),
+            "store_plugin_text": ConfigField(type=bool, default=False, description="插件发送的文本消息是否写入历史记录（False 则不入库）"),
             "enable_video_compression": ConfigField(type=bool, default=True, description="是否启用视频压缩功能"),
-            "compression_quality": ConfigField(type=int, default=23, description="视频压缩质量 (1-51，数值越小质量越高，推荐18-28)"),
+            "max_video_size_mb": ConfigField(type=int, default=100, description="视频文件大小限制（MB），超过此大小将进行压缩"),
+            "compression_quality": ConfigField(type=int, default=23, description="视频压缩质量 (1-51，数值越小质量越高，推荐 18-28)"),
             "enable_duration_limit": ConfigField(type=bool, default=True, description="是否启用视频时长限制"),
             "max_video_duration": ConfigField(type=int, default=600, description="视频最大时长限制（秒），超过此时长将拒绝发送"),
         },
         "ffmpeg": {
-            "show_warnings": ConfigField(type=bool, default=True, description="是否显示FFmpeg相关警告信息"),
+            "show_warnings": ConfigField(type=bool, default=True, description="是否显示 FFmpeg 相关警告信息"),
             "enable_hardware_acceleration": ConfigField(type=bool, default=True, description="是否启用硬件加速自动检测（推荐开启，可大幅提升视频压缩速度）"),
-            "force_encoder": ConfigField(type=str, default="", description="强制使用特定编码器（留空则自动选择，可选值：libx264/h264_nvenc/h264_qsv/h264_amf/h264_videotoolbox）"),
+            "force_encoder": ConfigField(type=str, default="", description="强制使用特定编码器（留空则自动选择，可选值：libx264 / h264_nvenc / h264_qsv / h264_amf / h264_videotoolbox）"),
             "encoder_priority": ConfigField(type=list, default=["nvidia", "intel", "amd", "apple"], description="编码器优先级（当检测到多个硬件编码器时的选择顺序）"),
         },
         "wsl": {
-            "enable_path_conversion": ConfigField(type=bool, default=True, description="是否启用Windows到WSL的路径转换"),
+            "enable_path_conversion": ConfigField(type=bool, default=False, description="是否启用 Windows 到 WSL 的路径转换"),
         },
         "api": {
-            "port": ConfigField(type=int, default=5700, description="API服务端口号"),
+            "host": ConfigField(
+                type=str,
+                default="127.0.0.1",
+                description="OneBot HTTP API 主机名/地址：Docker 部署时填服务名 napcat；非 Docker 本机部署可填 localhost/127.0.0.1；跨机部署填对方内网 IP 或域名",
+            ),
+            "port": ConfigField(
+                type=int,
+                default=5700,
+                description="OneBot HTTP API 端口号：需与 NapCat 的 HTTP Server 端口一致，默认 5700",
+            ),
+            "token": ConfigField(
+                type=str,
+                default="",
+                description="OneBot HTTP API Token：当 NapCat HTTP Server 配置了 Token 时需填写相同值；未启用鉴权可留空",
+            ),
         }
     }
 
@@ -2173,5 +2656,3 @@ class BilibiliVideoSenderPlugin(BasePlugin):
         return [
             (BilibiliAutoSendHandler.get_handler_info(), BilibiliAutoSendHandler),
         ]
-
-
