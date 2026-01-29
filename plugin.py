@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -20,6 +21,28 @@ from src.common.logger import get_logger
 
 # 为模块级独立函数创建logger
 _utils_logger = get_logger("plugin.bilibili_video_sender.utils")
+
+
+def _is_running_in_docker() -> bool:
+    """检测当前进程是否运行在 Docker 容器内。"""
+    if os.path.exists("/.dockerenv"):
+        return True
+    cgroup_path = "/proc/1/cgroup"
+    try:
+        with open(cgroup_path, "rt", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        return any(keyword in content for keyword in ("docker", "kubepods", "containerd"))
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+
+
+def _get_download_temp_dir() -> str:
+    """获取下载临时目录：Docker 使用共享目录，非 Docker 使用系统临时目录。"""
+    if _is_running_in_docker():
+        return "/MaiMBot/data/tmp"
+    return tempfile.gettempdir()
 
 
 def convert_windows_to_wsl_path(windows_path: str) -> str:
@@ -2115,7 +2138,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                         safe_title = re.sub(r"[\\/:*?\"<>|]+", "_", info.title).strip() or "bilibili_video"
                         unique_tag = f"{info.aid}_{info.cid}_{int(time.time() * 1000)}"
                         base_name = f"{safe_title}_{unique_tag}"
-                        tmp_dir = "/MaiMBot/data/tmp"
+                        tmp_dir = _get_download_temp_dir()
                         os.makedirs(tmp_dir, exist_ok=True)
 
                         temp_path = os.path.join(tmp_dir, f"{base_name}.mp4")
