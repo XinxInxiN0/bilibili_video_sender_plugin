@@ -15,6 +15,24 @@
 7. 在napcat上新建一个正向http,并在config.toml内填入端口
 8. 使用愉快 😊。
 
+## 清晰度设置（config.toml）
+
+在 `[bilibili]` 段新增：
+
+```toml
+[bilibili]
+qn = 0
+qn_strict = false
+```
+
+- `qn=0` 为自动：有 SESSDATA 默认请求 720P，无 SESSDATA 默认请求 480P
+- `qn_strict=true` 时清晰度不可用会直接报错（默认自动降级）
+
+常见 qn 对应表：
+- 6=240P，16=360P，32=480P，48=720P（MP4），64=720P，74=720P60
+- 80=1080P，112=1080P+，116=1080P60，120=4K，125=HDR，126=杜比视界，127=8K
+
+
 ---
 
 ## sessdata 和 buvid3 获取方法
