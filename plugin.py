@@ -88,6 +88,7 @@ from src.plugin_system.base.component_types import (
 )
 from src.plugin_system.apis.plugin_register_api import register_plugin
 from src.plugin_system.apis import send_api
+from src.config.config import global_config
 
 
 class FFmpegManager:
@@ -1979,6 +1980,15 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         if not url:
             return self._make_return_value(True, True, None)
 
+        # 群聊仅当被 @ 时才处理（判断 raw_message 中的 CQ 码）
+        if self.get_config("bilibili.group_at_only", False) and not self._is_private_message(message):
+            bot_qq = str(getattr(global_config.bot, "qq_account", "") or "").strip()
+            if not bot_qq:
+                self._logger.warning("group_at_only 已开启，但 bot qq_account 为空，无法判断 @ 目标")
+                return self._make_return_value(True, True, None)
+            if not re.search(rf"\[CQ:at,qq={re.escape(bot_qq)}\]", raw):
+                return self._make_return_value(True, True, None)
+
         fallback_qn = BilibiliParser._extract_qn_from_text(raw)
 
         self._logger.info("Bilibili video link detected", url=url, qn_from_text=fallback_qn)
@@ -2157,10 +2167,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 selected_qn = config_opts.get("selected_qn")
                 requested_qn = config_opts.get("requested_qn")
                 if selected_qn_name and selected_qn:
-                    if requested_qn and selected_qn and requested_qn != selected_qn:
-                        success_message = f"解析成功，已选择：{selected_qn_name}（降级自：{requested_qn_name}）"
-                    else:
-                        success_message = f"解析成功，已选择：{selected_qn_name}"
+                    success_message = f"解析成功，已选择：{selected_qn_name}"
                 await self._send_text(success_message, stream_id)
 
                 # 现在获取FFmpeg信息（应该是瞬间完成，因为_blocking已经在后台初始化了缓存）
@@ -2653,7 +2660,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.3.2", description="配置版本"),
+            "config_version": ConfigField(type=str, default="1.3.3", description="配置版本"),
             "use_new_events_manager": ConfigField(type=bool, default=True, description="是否使用新版 events_manager（0.10.2 及以上版本设为 True，否则设为 False）"),
         },
         "bilibili": {
@@ -2661,6 +2668,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
             "buvid3": ConfigField(type=str, default="", description="B 站设备标识 Buvid3（可选，用于生成 session 参数）"),
             "qn": ConfigField(type=int, default=0, description="清晰度设置(qn)，0 为自动（登录默认 720P，未登录默认 480P）。常见值：16 = 360P, 32 = 480P, 64 = 720P, 74 = 720P60, 80 = 1080P, 112 = 1080P+, 116 = 1080P60, 120 = 4K, 125 = HDR, 126 = 杜比视界, 127 = 8K"),
             "qn_strict": ConfigField(type=bool, default=False, description="是否严格按 qn 选择清晰度。False 时会在可用流中自动降级/回退；True 时不可用则报错"),
+            "group_at_only": ConfigField(type=bool, default=False, description="群聊中仅当被 @ 时才处理 B 站链接"),
             "block_ai_reply": ConfigField(type=bool, default=True, description="检测到 B 站视频链接后是否阻止后续 AI 回复（仅影响本次事件链路）（旧版 events_manager 下可能无效）"),
             "store_plugin_text": ConfigField(type=bool, default=False, description="插件发送的文本消息是否写入历史记录（False 则不入库）"),
             "enable_video_compression": ConfigField(type=bool, default=True, description="是否启用视频压缩功能"),
