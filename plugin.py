@@ -17,6 +17,8 @@ import aiohttp
 
 from typing import Any, Dict, List, Optional, Tuple, Type
 
+from maim_message import Seg
+
 from src.common.logger import get_logger
 
 # 为模块级独立函数创建logger
@@ -1974,9 +1976,19 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             self._logger.debug("插件已禁用，退出处理")
             return self._make_return_value(True, True, None)
 
-        raw: str = getattr(message, "raw_message", "") or ""
-
-        url = BilibiliParser.find_first_bilibili_url(raw)
+        url = ""
+        # 优先从消息段中提取QQ小程序链接
+        segments: Seg = message.message_segments
+        for seg in segments:
+            if seg.type == "miniapp_card":
+                raw = seg.data.get("source_url", "")
+                url = BilibiliParser.find_first_bilibili_url(raw)
+                if url:
+                    break
+        # 消息段中未找到，改为从 raw_message 中提取
+        if not url:
+            raw: str = getattr(message, "raw_message", "") or ""
+            url = BilibiliParser.find_first_bilibili_url(raw)
         if not url:
             return self._make_return_value(True, True, None)
 
