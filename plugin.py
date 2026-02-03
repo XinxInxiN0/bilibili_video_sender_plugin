@@ -1976,19 +1976,15 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             self._logger.debug("插件已禁用，退出处理")
             return self._make_return_value(True, True, None)
 
-        url = ""
-        # 优先从消息段中提取QQ小程序链接
-        segments: Seg = message.message_segments
-        for seg in segments:
+        raw = ""
+        # 仅处理第一段消息，否则在处理被引用信息是会出现误判
+        seg: Seg = message.message_segments[0]
+        if seg.type == "text":
+            raw = seg.data
+        if self.get_config("parser.enable_miniapp_card", True):
             if seg.type == "miniapp_card":
                 raw = seg.data.get("source_url", "")
-                url = BilibiliParser.find_first_bilibili_url(raw)
-                if url:
-                    break
-        # 消息段中未找到，改为从 raw_message 中提取
-        if not url:
-            raw: str = getattr(message, "raw_message", "") or ""
-            url = BilibiliParser.find_first_bilibili_url(raw)
+        url = BilibiliParser.find_first_bilibili_url(raw)
         if not url:
             return self._make_return_value(True, True, None)
 
@@ -2717,6 +2713,9 @@ class BilibiliVideoSenderPlugin(BasePlugin):
             "compression_quality": ConfigField(type=int, default=23, description="视频压缩质量 (1-51，数值越小质量越高，推荐 18-28)"),
             "enable_duration_limit": ConfigField(type=bool, default=True, description="是否启用视频时长限制"),
             "max_video_duration": ConfigField(type=int, default=600, description="视频最大时长限制（秒），超过此时长将拒绝发送"),
+        },
+        "parser" : {
+            "enable_miniapp_card": ConfigField(type=bool, default=False, description="是否允许解析B站小卡片"),
         },
         "ffmpeg": {
             "show_warnings": ConfigField(type=bool, default=True, description="是否显示 FFmpeg 相关警告信息"),
