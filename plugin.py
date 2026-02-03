@@ -1981,7 +1981,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
         seg: Seg = message.message_segments[0]
         if seg.type == "text":
             raw = seg.data
-        if self.get_config("parser.enable_miniapp_card", True):
+        if self.get_config("parser.enable_miniapp_card", False):
             if seg.type == "miniapp_card":
                 raw = seg.data.get("source_url", "")
         url = BilibiliParser.find_first_bilibili_url(raw)
