@@ -17,6 +17,8 @@ import aiohttp
 
 from typing import Any, Dict, List, Optional, Tuple, Type
 
+from maim_message import Seg
+
 from src.common.logger import get_logger
 
 # 为模块级独立函数创建logger
@@ -1974,8 +1976,14 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             self._logger.debug("插件已禁用，退出处理")
             return self._make_return_value(True, True, None)
 
-        raw: str = getattr(message, "raw_message", "") or ""
-
+        raw = ""
+        # 仅处理第一段消息，否则在处理被引用信息是会出现误判
+        seg: Seg = message.message_segments[0]
+        if seg.type == "text":
+            raw = seg.data
+        if self.get_config("parser.enable_miniapp_card", False):
+            if seg.type == "miniapp_card":
+                raw = seg.data.get("source_url", "")
         url = BilibiliParser.find_first_bilibili_url(raw)
         if not url:
             return self._make_return_value(True, True, None)
@@ -2689,7 +2697,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.3.4", description="配置版本"),
+            "config_version": ConfigField(type=str, default="1.3.5", description="配置版本"),
             "use_new_events_manager": ConfigField(type=bool, default=True, description="是否使用新版 events_manager（0.10.2 及以上版本设为 True，否则设为 False）"),
         },
         "bilibili": {
@@ -2705,6 +2713,9 @@ class BilibiliVideoSenderPlugin(BasePlugin):
             "compression_quality": ConfigField(type=int, default=23, description="视频压缩质量 (1-51，数值越小质量越高，推荐 18-28)"),
             "enable_duration_limit": ConfigField(type=bool, default=True, description="是否启用视频时长限制"),
             "max_video_duration": ConfigField(type=int, default=600, description="视频最大时长限制（秒），超过此时长将拒绝发送"),
+        },
+        "parser" : {
+            "enable_miniapp_card": ConfigField(type=bool, default=False, description="是否允许解析B站小卡片"),
         },
         "ffmpeg": {
             "show_warnings": ConfigField(type=bool, default=True, description="是否显示 FFmpeg 相关警告信息"),
