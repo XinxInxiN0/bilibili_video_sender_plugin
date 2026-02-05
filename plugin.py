@@ -373,7 +373,7 @@ class BilibiliParser:
 
     # 允许匹配携带查询参数的链接（用于保留 ?p= 分P 信息）
     VIDEO_URL_PATTERN = re.compile(
-        r"https?://(?:www\.)?bilibili\.com/video/(?P<bv>BV[\w]+|av\d+)(?:\?[^\s#]+)?",
+        r"https?://(?:(?:www|m)\.)?bilibili\.com/video/(?P<bv>BV[\w]+|av\d+)(?:/)?(?:\?[^\s#]+)?",
         re.IGNORECASE,
     )
     B23_SHORT_PATTERN = re.compile(
@@ -567,7 +567,8 @@ class BilibiliParser:
 
     @staticmethod
     def _follow_redirect(url: str) -> str:
-        req = BilibiliParser._build_request(url)
+        # 使用 curl UA，可以有效避免在服务器上发送网络请求被 412（经测试，BilibiliParser.USER_AGENT 也可能会被封控）
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public short URL
             return resp.geturl()
 
