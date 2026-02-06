@@ -17,6 +17,8 @@ import aiohttp
 
 from typing import Any, Dict, List, Optional, Tuple, Type
 
+from maim_message import Seg
+
 from src.common.logger import get_logger
 
 # 为模块级独立函数创建logger
@@ -1975,8 +1977,14 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             self._logger.debug("插件已禁用，退出处理")
             return self._make_return_value(True, True, None)
 
-        raw: str = getattr(message, "raw_message", "") or ""
-
+        raw = ""
+        # 仅处理第一段消息，否则在处理被引用信息是会出现误判
+        seg: Seg = message.message_segments[0]
+        if seg.type == "text":
+            raw = seg.data
+        if self.get_config("parser.enable_miniapp_card", False):
+            if seg.type == "miniapp_card":
+                raw = seg.data.get("source_url", "")
         url = BilibiliParser.find_first_bilibili_url(raw)
         if not url:
             return self._make_return_value(True, True, None)
@@ -2074,19 +2082,31 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 loop = asyncio.get_running_loop()
 
                 def _blocking() -> Optional[Tuple[BilibiliVideoInfo, Dict[str, Any], str]]:
-                    # 在后台线程处理短链接跳转
+                    # 在后台线程处理短链接跳转，带重试机制
                     target_url = url
                     if "b23.tv" in target_url:
-                        try:
-                            self._logger.debug(f"Resolving short link: {target_url}")
-                            target_url = BilibiliParser._follow_redirect(target_url)
-                            self._logger.debug(f"Resolved to: {target_url}")
-                        except Exception as e:
-                            self._logger.warning(f"Failed to resolve short link: {e}")
+                        # 短链接解析重试：最多3次尝试（1次原始 + 2次重试）
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                self._logger.debug(f"Resolving short link (attempt {attempt + 1}/{max_retries}): {target_url}")
+                                target_url = BilibiliParser._follow_redirect(target_url)
+                                self._logger.debug(f"Resolved to: {target_url}")
+                                break  # 成功则跳出重试循环
+                            except Exception as e:
+                                self._logger.warning(f"Failed to resolve short link (attempt {attempt + 1}/{max_retries}): {e}")
+                                if attempt < max_retries - 1:
+                                    # 线性退避：第1次重试等1秒，第2次重试等2秒
+                                    wait_time = attempt + 1
+                                    self._logger.info(f"Retrying in {wait_time} seconds...")
+                                    time.sleep(wait_time)
+                                else:
+                                    # 所有重试都失败，记录错误并使用原始URL继续
+                                    self._logger.error(f"Failed to resolve short link after {max_retries} attempts, using original URL")
 
                     target_url = BilibiliParser._sanitize_url(target_url)
 
-                    # URL 参数覆盖：在解析跳转后的 URL 中提取 qn 参数
+                    # URL 参数覆盖:在解析跳转后的 URL 中提取 qn 参数
                     url_qn = BilibiliParser._extract_qn_param(target_url)
                     if url_qn is None and fallback_qn is not None:
                         url_qn = fallback_qn
@@ -2102,12 +2122,29 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                         self._logger.debug("Initializing FFmpeg manager cache in background...")
                         _ffmpeg_manager.check_ffmpeg_availability()
 
-                    info = BilibiliParser.get_view_info_by_url(target_url, config_opts)
+                    # 视频信息解析重试：最多3次尝试
+                    info = None
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            self._logger.debug(f"Parsing video info (attempt {attempt + 1}/{max_retries}): {target_url}")
+                            info = BilibiliParser.get_view_info_by_url(target_url, config_opts)
+                            if info:
+                                self._logger.debug("Video info parsed", title=info.title, aid=info.aid, cid=info.cid)
+                                break  # 成功则跳出重试循环
+                            else:
+                                self._logger.warning(f"Failed to parse video info (attempt {attempt + 1}/{max_retries}): returned None")
+                        except Exception as e:
+                            self._logger.warning(f"Failed to parse video info (attempt {attempt + 1}/{max_retries}): {e}")
+                        
+                        if attempt < max_retries - 1:
+                            wait_time = attempt + 1
+                            self._logger.info(f"Retrying in {wait_time} seconds...")
+                            time.sleep(wait_time)
+                    
                     if not info:
-                        self._logger.error("Failed to parse video info", url=target_url)
+                        self._logger.error(f"Failed to parse video info after {max_retries} attempts", url=target_url)
                         return None
-
-                    self._logger.debug("Video info parsed", title=info.title, aid=info.aid, cid=info.cid)
 
                     sources, status = BilibiliParser.get_play_urls(info.aid, info.cid, config_opts)
                     source_type = sources.get("type") if sources else "none"
@@ -2661,7 +2698,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.3.3", description="配置版本"),
+            "config_version": ConfigField(type=str, default="1.3.5", description="配置版本"),
             "use_new_events_manager": ConfigField(type=bool, default=True, description="是否使用新版 events_manager（0.10.2 及以上版本设为 True，否则设为 False）"),
         },
         "bilibili": {
@@ -2677,6 +2714,9 @@ class BilibiliVideoSenderPlugin(BasePlugin):
             "compression_quality": ConfigField(type=int, default=23, description="视频压缩质量 (1-51，数值越小质量越高，推荐 18-28)"),
             "enable_duration_limit": ConfigField(type=bool, default=True, description="是否启用视频时长限制"),
             "max_video_duration": ConfigField(type=int, default=600, description="视频最大时长限制（秒），超过此时长将拒绝发送"),
+        },
+        "parser" : {
+            "enable_miniapp_card": ConfigField(type=bool, default=False, description="是否允许解析B站小卡片"),
         },
         "ffmpeg": {
             "show_warnings": ConfigField(type=bool, default=True, description="是否显示 FFmpeg 相关警告信息"),
