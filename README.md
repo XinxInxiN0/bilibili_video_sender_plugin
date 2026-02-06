@@ -12,7 +12,7 @@
 4. 解压 ffmpeg。
 5. 将解压后的 ffmpeg 文件夹放到 `bilibili_video_sender_plugin` 目录下。
 6. 先运行一次麦麦生成config.toml。再打开 `config.toml`，填入 `sessdata` 和 `buvid3`（获取方法见下方）。
-7. 在napcat上新建一个正向http,并在config.toml内填入端口
+7. 在napcat上新建一个正向http（服务器）,并在config.toml内填入端口
 8. 使用愉快 😊。
 
 ## 清晰度设置（config.toml）
