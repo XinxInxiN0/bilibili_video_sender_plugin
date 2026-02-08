@@ -1643,6 +1643,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
     event_type = EventType.ON_MESSAGE
     handler_name = "bilibili_auto_send_handler"
     handler_description = "解析B站视频链接并发送视频"
+    # 提高 ON_MESSAGE 阶段的执行优先级，尽量早于其他插件处理
+    weight = 50
     intercept_message = False
 
     def set_plugin_config(self, plugin_config: Dict) -> None:
@@ -1977,15 +1979,35 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             self._logger.debug("插件已禁用，退出处理")
             return self._make_return_value(True, True, None)
 
-        raw = ""
-        # 仅处理第一段消息，否则在处理被引用信息是会出现误判
-        seg: Seg = message.message_segments[0]
-        if seg.type == "text":
-            raw = seg.data
+        # raw_message 保留原始 CQ 文本（用于 @ 判定与文本兜底提取）
+        raw_message: str = getattr(message, "raw_message", "") or ""
+        parse_source = raw_message
+        url = ""
+        # message_segments 提供结构化消息段（如 miniapp_card / at / mention_bot）
+        segments: List[Seg] = list(getattr(message, "message_segments", []) or [])
+
+        # 启用时优先从小程序卡片提取 B 站链接，避免被其他文本噪声干扰
         if self.get_config("parser.enable_miniapp_card", False):
-            if seg.type == "miniapp_card":
-                raw = seg.data.get("source_url", "")
-        url = BilibiliParser.find_first_bilibili_url(raw)
+            for seg in segments:
+                if getattr(seg, "type", None) != "miniapp_card":
+                    continue
+                seg_data = getattr(seg, "data", None)
+                if isinstance(seg_data, dict):
+                    source_url = str(seg_data.get("source_url", "") or "")
+                else:
+                    source_url = str(getattr(seg_data, "source_url", "") or "")
+                if not source_url:
+                    continue
+                miniapp_url = BilibiliParser.find_first_bilibili_url(source_url)
+                if miniapp_url:
+                    parse_source = source_url
+                    url = miniapp_url
+                    break
+
+        # 小程序未命中时，回退到 raw_message 提取普通链接
+        if not url:
+            url = BilibiliParser.find_first_bilibili_url(raw_message)
+            parse_source = raw_message
         if not url:
             return self._make_return_value(True, True, None)
 
@@ -1995,10 +2017,40 @@ class BilibiliAutoSendHandler(BaseEventHandler):
             if not bot_qq:
                 self._logger.warning("group_at_only 已开启，但 bot qq_account 为空，无法判断 @ 目标")
                 return self._make_return_value(True, True, None)
-            if not re.search(rf"\[CQ:at,qq={re.escape(bot_qq)}\]", raw):
+
+            # 先用 raw_message 的 CQ 码判定是否 @ 到机器人
+            mentioned = bool(re.search(rf"\[CQ:at,qq={re.escape(bot_qq)}\]", raw_message))
+            # 再兼容适配层注入的提及标记
+            if not mentioned and isinstance(getattr(message, "additional_data", None), dict):
+                additional_data = message.additional_data
+                if additional_data.get("at_bot") is True:
+                    mentioned = True
+                elif additional_data.get("is_mentioned") is True:
+                    mentioned = True
+            # 最后从结构化消息段兜底判定（mention_bot / at）
+            if not mentioned:
+                for seg in segments:
+                    seg_type = getattr(seg, "type", None)
+                    if seg_type == "mention_bot":
+                        mentioned = True
+                        break
+                    if seg_type == "at":
+                        seg_data = getattr(seg, "data", None)
+                        if isinstance(seg_data, dict):
+                            mention_qq = str(seg_data.get("qq", "") or "").strip()
+                        else:
+                            mention_qq = str(getattr(seg_data, "qq", "") or "").strip()
+                        if mention_qq == bot_qq:
+                            mentioned = True
+                            break
+
+            if not mentioned:
                 return self._make_return_value(True, True, None)
 
-        fallback_qn = BilibiliParser._extract_qn_from_text(raw)
+        # 优先从实际解析来源提取 qn；小程序场景再回退 raw_message 兜底
+        fallback_qn = BilibiliParser._extract_qn_from_text(parse_source)
+        if fallback_qn is None and parse_source != raw_message:
+            fallback_qn = BilibiliParser._extract_qn_from_text(raw_message)
 
         self._logger.info("Bilibili video link detected", url=url, qn_from_text=fallback_qn)
         # 检测到视频链接后，是否阻止后续 AI 回复
@@ -2698,7 +2750,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.3.5", description="配置版本"),
+            "config_version": ConfigField(type=str, default="1.3.6", description="配置版本"),
             "use_new_events_manager": ConfigField(type=bool, default=True, description="是否使用新版 events_manager（0.10.2 及以上版本设为 True，否则设为 False）"),
         },
         "bilibili": {
