@@ -2158,6 +2158,14 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
                     target_url = BilibiliParser._sanitize_url(target_url)
 
+                    # 检查是否为支持的视频链接 (BV 或 av)
+                    has_bv = BilibiliParser._extract_bvid(target_url) is not None
+                    has_av = re.search(r"/video/av\d+", target_url) is not None
+                    
+                    if not (has_bv or has_av):
+                        self._logger.info(f"Resolved URL is not a standard video link, ignoring: {target_url}")
+                        return None, None, "unsupported_type"
+
                     # URL 参数覆盖:在解析跳转后的 URL 中提取 qn 参数
                     url_qn = BilibiliParser._extract_qn_param(target_url)
                     if url_qn is None and fallback_qn is not None:
@@ -2219,6 +2227,10 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                     return self._make_return_value(True, continue_processing, "解析失败")
 
                 info, sources, status = result
+                if status == "unsupported_type":
+                    self._logger.info("Ignoring unsupported Bilibili link type (e.g. Live room)")
+                    return self._make_return_value(True, continue_processing, "跳过非视频链接")
+
                 if not sources:
                     error_msg = f"解析失败：{status}"
                     self._logger.error(error_msg)
@@ -2750,7 +2762,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.3.6", description="配置版本"),
+            "config_version": ConfigField(type=str, default="1.3.7", description="配置版本"),
             "use_new_events_manager": ConfigField(type=bool, default=True, description="是否使用新版 events_manager（0.10.2 及以上版本设为 True，否则设为 False）"),
         },
         "bilibili": {
