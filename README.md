@@ -9,7 +9,7 @@
 1. 下载本插件。
 2. 将插件解压到麦麦的 `plugins` 目录。
 3. 下载 [ffmpeg](https://ffmpeg.org/)。（不要下载源代码！！！下Windows版啊，别拿着源代码来找我说你为什么用不了）
-4. 解压 ffmpeg。
+4. 解压 ffmpeg 并重命名为 **ffmpeg**
 5. 将解压后的 ffmpeg 文件夹放到 `bilibili_video_sender_plugin` 目录下。
 6. 先运行一次麦麦生成config.toml。再打开 `config.toml`，填入 `sessdata` 和 `buvid3`（获取方法见下方）。
 7. 在napcat上新建一个正向http（服务器）,并在config.toml内填入端口
