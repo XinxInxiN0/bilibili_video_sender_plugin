@@ -7,3 +7,4 @@ config.toml
 /.kilocode
 /tests
 pytest.ini
+tmp/

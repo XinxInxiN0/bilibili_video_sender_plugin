@@ -9,7 +9,6 @@ import platform
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -46,10 +45,12 @@ def _is_running_in_docker() -> bool:
 
 
 def _get_download_temp_dir() -> str:
-    """获取下载临时目录：Docker 使用共享目录，非 Docker 使用系统临时目录。"""
+    """获取下载临时目录：Docker 使用共享目录，非 Docker 使用插件目录下的 tmp 文件夹。"""
     if _is_running_in_docker():
         return "/MaiMBot/data/tmp"
-    return tempfile.gettempdir()
+    # 使用插件目录下的 tmp 文件夹
+    plugin_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(plugin_dir, "tmp")
 
 
 def convert_windows_to_wsl_path(windows_path: str) -> str:
@@ -2786,11 +2787,11 @@ class BilibiliAutoSendHandler(BaseEventHandler):
 
                 # 发送处理后的视频文件
                 async def _try_send(path: str) -> bool:
-                    # 在发送前进行WSL路径转换
-                    enable_conversion = self.get_config("wsl.enable_path_conversion", False)
-                    converted_path = convert_windows_to_wsl_path(path) if enable_conversion else path
+                    # 根据运行环境模式进行路径转换
+                    runtime_mode = self.get_config("environment.runtime_mode", "windows")
+                    converted_path = convert_windows_to_wsl_path(path) if runtime_mode == "wsl" else path
 
-                    self._logger.debug(f"Sending single video - path conversion enabled: {enable_conversion}")
+                    self._logger.debug(f"Sending single video - runtime mode: {runtime_mode}")
                     self._logger.debug(f"Sending single video - original path: {path}")
                     self._logger.debug(f"Sending single video - converted path: {converted_path}")
 
@@ -2875,7 +2876,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.3.7", description="配置版本"),
+            "config_version": ConfigField(type=str, default="1.4.0", description="配置版本"),
             "use_new_events_manager": ConfigField(
                 type=bool,
                 default=True,
@@ -2939,9 +2940,11 @@ class BilibiliVideoSenderPlugin(BasePlugin):
                 description="编码器优先级（当检测到多个硬件编码器时的选择顺序）",
             ),
         },
-        "wsl": {
-            "enable_path_conversion": ConfigField(
-                type=bool, default=False, description="是否启用 Windows 到 WSL 的路径转换"
+        "environment": {
+            "runtime_mode": ConfigField(
+                type=str,
+                default="windows",
+                description="运行环境模式：windows = 纯 Windows 环境（MaiBot 和 NapCat 都在 Windows）| wsl = WSL 混合环境（MaiBot 在 Windows，NapCat 在 WSL）| linux = 纯 Linux 环境（都在 Linux）",
             ),
         },
         "api": {
