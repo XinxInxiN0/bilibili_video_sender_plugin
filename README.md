@@ -3,7 +3,7 @@
 还有问题加qq3087033824
 觉得好用的话，可以点个star
 ### 请务必认真填写config.toml！！！！！
-### 如果你不知道什么是wsl，请务必保证wsl转换为false！！！
+### 请根据你的实际运行环境正确配置 runtime_mode（见下方"环境模式配置"章节）！！！
 ## 使用方法
 
 1. 下载本插件。
@@ -14,6 +14,21 @@
 6. 先运行一次麦麦生成config.toml。再打开 `config.toml`，填入 `sessdata` 和 `buvid3`（获取方法见下方）。
 7. 在napcat上新建一个正向http（服务器）,并在config.toml内填入端口
 8. 使用愉快 😊。
+
+## 环境模式配置（重要！）
+
+在 `config.toml` 的 `[environment]` 段中，需要根据你的实际运行环境配置 `runtime_mode`：
+
+```toml
+[environment]
+runtime_mode = "windows"  # 根据实际情况选择：windows / wsl / linux
+```
+
+### 如何选择？
+
+- **如果你用的是一件包或者不知道什么是 WSL**：选择 `windows`
+- **如果你的 NapCat 在 WSL 中运行**：选择 `wsl`
+- **如果你在 Linux 服务器上部署**：选择 `linux`
 
 ## 清晰度设置（config.toml）
 
