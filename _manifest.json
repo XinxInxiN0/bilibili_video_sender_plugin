@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "麦麦发 B 站视频",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "让麦麦解析 B 站视频链接并发送，群聊私聊都可用",
   "author": {
     "name": "XinxInxiN0",
