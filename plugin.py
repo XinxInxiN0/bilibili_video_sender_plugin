@@ -53,6 +53,14 @@ def _get_download_temp_dir() -> str:
     return os.path.join(plugin_dir, "tmp")
 
 
+def _set_file_permissions(file_path: str) -> None:
+    """设置文件权限为644，确保其他进程可以读取文件。"""
+    try:
+        os.chmod(file_path, 0o644)
+    except Exception as e:
+        _utils_logger.warning(f"Failed to set file permissions for {file_path}: {e}")
+
+
 def convert_windows_to_wsl_path(windows_path: str) -> str:
     """将Windows路径转换为WSL路径
 
@@ -2414,6 +2422,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                                         progress_bar.finish()
                                         if total_size > 0 and downloaded < total_size:
                                             raise IOError(f"下载不完整: {downloaded}/{total_size}")
+                                    # 设置文件权限，确保其他进程可以读取
+                                    _set_file_permissions(save_path)
                                     return True
                                 except Exception as e:
                                     last_err = e
@@ -2558,6 +2568,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                                     result = subprocess.run(ffmpeg_cmd, capture_output=True, text=False)
                                     if result.returncode == 0:
                                         self._logger.debug("Video and audio merged successfully")
+                                        # 设置文件权限
+                                        _set_file_permissions(temp_path)
                                         try:
                                             if os.path.exists(video_temp):
                                                 os.remove(video_temp)
@@ -2577,6 +2589,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                                         fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=False)
                                         if fallback_result.returncode == 0:
                                             self._logger.warning("Audio merge failed, fallback to video-only mp4")
+                                            # 设置文件权限
+                                            _set_file_permissions(temp_path)
                                             try:
                                                 if os.path.exists(video_temp):
                                                     os.remove(video_temp)
@@ -2633,6 +2647,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                                     remux_result = subprocess.run(remux_cmd, capture_output=True, text=False)
                                     if remux_result.returncode == 0:
                                         self._logger.debug("Single file remuxed to mp4")
+                                        # 设置文件权限
+                                        _set_file_permissions(remux_path)
                                         try:
                                             os.remove(download_path)
                                         except Exception:
@@ -2876,7 +2892,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.4.0", description="配置版本"),
+            "config_version": ConfigField(type=str, default="1.4.1", description="配置版本"),
             "use_new_events_manager": ConfigField(
                 type=bool,
                 default=True,
