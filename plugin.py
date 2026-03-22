@@ -2331,9 +2331,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 # 发送解析成功消息
                 success_message = "解析成功"
                 selected_qn_name = config_opts.get("selected_qn_name")
-                config_opts.get("requested_qn_name")
                 selected_qn = config_opts.get("selected_qn")
-                config_opts.get("requested_qn")
                 if selected_qn_name and selected_qn:
                     success_message = f"解析成功，已选择：{selected_qn_name}"
                 await self._send_text(success_message, stream_id)
