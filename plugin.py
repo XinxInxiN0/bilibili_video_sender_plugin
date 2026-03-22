@@ -29,6 +29,19 @@ from src.plugin_system.base.config_types import ConfigField
 _utils_logger = get_logger("plugin.bilibili_video_sender.utils")
 
 
+def _log_task_exception(task: asyncio.Task) -> None:
+    """Fire-and-forget 任务的异常记录回调，防止异常被静默丢弃。"""
+    if not task.cancelled() and not task.exception() is None:
+        try:
+            exc = task.exception()
+        except Exception:
+            return
+        import logging
+        logging.getLogger("plugin.bilibili_video_sender.plugin").error(
+            "后台视频处理任务抛出未捕获异常", exc_info=exc
+        )
+
+
 def _is_running_in_docker() -> bool:
     """检测当前进程是否运行在 Docker 容器内。"""
     if os.path.exists("/.dockerenv"):
@@ -1710,6 +1723,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
     """收到包含哔哩哔哩视频链接的消息后，自动解析并发送视频。"""
 
     _logger = get_logger("plugin.bilibili_video_sender.handler")
+    _pending_tasks: set = set()  # 追踪后台 fire-and-forget 任务，防止 GC 提前回收
 
     event_type = EventType.ON_MESSAGE
     handler_name = "bilibili_auto_send_handler"
@@ -2142,6 +2156,7 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 return self._make_return_value(True, continue_processing, "无法获取聊天流ID")
 
         async def _process_video() -> Tuple[bool, bool, str | None]:
+            temp_path: Optional[str] = None  # 崩溃时用于清理的哨兵变量
             try:
                 # （原有的FFmpeg同步检查已移除，改为在后台初始化缓存）
 
@@ -2424,8 +2439,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                                     try:
                                         if os.path.exists(save_path):
                                             os.remove(save_path)
-                                    except Exception:
-                                        pass
+                                    except Exception as _del_err:
+                                        self._logger.warning(f"删除不完整下载文件失败 {save_path}: {_del_err}")
                             if last_err:
                                 self._logger.error(f"{desc} 所有链接下载失败: {last_err}")
                             return False
@@ -2583,10 +2598,13 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                                             try:
                                                 if os.path.exists(video_temp):
                                                     os.remove(video_temp)
+                                            except Exception as _del_err:
+                                                self._logger.warning(f"删除 video_temp 失败 {video_temp}: {_del_err}")
+                                            try:
                                                 if audio_temp and os.path.exists(audio_temp):
                                                     os.remove(audio_temp)
-                                            except Exception:
-                                                pass
+                                            except Exception as _del_err:
+                                                self._logger.warning(f"删除 audio_temp 失败 {audio_temp}: {_del_err}")
                                             return temp_path
                                         fallback_err = (
                                             fallback_result.stderr.decode("utf-8", errors="replace")
@@ -2603,13 +2621,13 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                             if audio_temp and os.path.exists(audio_temp):
                                 try:
                                     os.remove(audio_temp)
-                                except Exception:
-                                    pass
+                                except Exception as _del_err:
+                                    self._logger.warning(f"删除 audio_temp 失败 {audio_temp}: {_del_err}")
                             if os.path.exists(video_temp):
                                 try:
                                     os.remove(video_temp)
-                                except Exception:
-                                    pass
+                                except Exception as _del_err:
+                                    self._logger.warning(f"删除 video_temp 失败 {video_temp}: {_del_err}")
                             return None
 
                         # durl：单文件直链下载（可能带备链）
@@ -2638,8 +2656,8 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                                         self._logger.debug("Single file remuxed to mp4")
                                         try:
                                             os.remove(download_path)
-                                        except Exception:
-                                            pass
+                                        except Exception as _del_err:
+                                            self._logger.warning(f"删除原始下载文件失败 {download_path}: {_del_err}")
                                         final_path = remux_path
                                     else:
                                         stderr_text = (
@@ -2849,11 +2867,21 @@ class BilibiliAutoSendHandler(BaseEventHandler):
                 return self._make_return_value(True, continue_processing, "已发送视频（若宿主支持）")
             except Exception as e:
                 self._logger.error(f"视频处理异常: {e}")
+                # 清理崩溃前已创建的临时文件，防止孤立文件堆积
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                        self._logger.debug(f"已清理崩溃残留临时文件: {temp_path}")
+                    except Exception as _del_err:
+                        self._logger.warning(f"清理崩溃残留临时文件失败: {_del_err}")
                 return self._make_return_value(True, continue_processing, "解析失败")
 
         # block_ai_reply=True 时立即返回，避免阻塞事件链路；后台任务继续处理下载与发送
         if block_ai_reply:
-            asyncio.create_task(_process_video())
+            _task = asyncio.create_task(_process_video())
+            self._pending_tasks.add(_task)
+            _task.add_done_callback(self._pending_tasks.discard)
+            _task.add_done_callback(_log_task_exception)
             return self._make_return_value(True, False, "已接管B站链接处理")
 
         return await _process_video()
