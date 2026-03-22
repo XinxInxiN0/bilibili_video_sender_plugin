@@ -2879,7 +2879,7 @@ class BilibiliVideoSenderPlugin(BasePlugin):
     config_schema: Dict[str, Dict[str, ConfigField]] = {
         "plugin": {
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
-            "config_version": ConfigField(type=str, default="1.4.2", description="配置版本"),
+            "config_version": ConfigField(type=str, default="1.4.3", description="配置版本"),
             "use_new_events_manager": ConfigField(
                 type=bool,
                 default=True,
