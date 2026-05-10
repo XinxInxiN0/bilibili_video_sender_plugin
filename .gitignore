@@ -5,8 +5,6 @@ config.toml
 config.toml.backup
 config.toml
 /.kilocode
-/tests
-pytest.ini
 tmp/
 /.claude
 CLAUDE.md
