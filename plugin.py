@@ -32,7 +32,10 @@ class BilibiliConfig(PluginConfigBase):
     qn_strict: bool = Field(default=False, description="是否严格按 qn 选择清晰度")
     group_at_only: bool = Field(default=False, description="群聊中仅当被 @ 时才处理 B 站链接")
     block_ai_reply: bool = Field(default=True, description="检测到 B 站视频链接后是否阻止后续 AI 回复")
+<<<<<<< Updated upstream
     store_plugin_text: bool = Field(default=False, description="插件发送的文本消息是否写入历史记录")
+=======
+>>>>>>> Stashed changes
     enable_video_compression: bool = Field(default=True, description="是否启用视频压缩功能")
     max_video_size_mb: int = Field(default=100, description="视频文件大小限制（MB），超过此大小将进行压缩", ge=1)
     compression_quality: int = Field(default=23, description="视频压缩质量 (1-51，数值越小质量越高)", ge=1, le=51)
@@ -89,7 +92,11 @@ class PluginMetaConfig(PluginConfigBase):
     __ui_label__ = "插件设置"
     __ui_order__ = 0
 
+<<<<<<< Updated upstream
     config_version: str = Field(default="2.0.0", description="配置版本（勿手动修改）")
+=======
+    config_version: str = Field(default="2.0.1", description="配置版本（勿手动修改）")
+>>>>>>> Stashed changes
     enabled: bool = Field(default=True, description="是否启用插件")
 
 
@@ -240,6 +247,7 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         config = self.config.bilibili
         try:
             loop = asyncio.get_running_loop()
+<<<<<<< Updated upstream
 
             # Step 1: 解析视频信息 + 获取播放地址（阻塞）
             info, sources, selected_qn_name, status, error_msg = await loop.run_in_executor(
@@ -356,10 +364,138 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
 
         target_url = url
 
+=======
+
+            # Step 1: 解析视频信息 + 获取播放地址（阻塞）
+            info, sources, selected_qn_name, status, error_msg = await loop.run_in_executor(
+                None, self._resolve_video_sync, url, fallback_qn
+            )
+
+            if status == "unsupported_type":
+                self.ctx.logger.info("Ignoring unsupported Bilibili link type")
+                return
+
+            if not info or not sources:
+                await send_text(self.ctx, error_msg or "未能解析该视频链接，请稍后重试。", session_id, message, self.config.api)
+                return
+
+            # Step 2: 时长校验
+            if config.enable_duration_limit and info.duration is not None:
+                if info.duration > config.max_video_duration:
+                    duration_min = int(info.duration // 60)
+                    duration_sec = int(info.duration % 60)
+                    max_min = int(config.max_video_duration // 60)
+                    max_sec = int(config.max_video_duration % 60)
+                    await send_text(
+                        self.ctx,
+                        f"视频时长超过限制：视频时长为 {duration_min}分{duration_sec}秒，"
+                        f"最大允许时长为 {max_min}分{max_sec}秒。",
+                        session_id,
+                        message,
+                        self.config.api,
+                    )
+                    return
+
+            # Step 3: 通知用户解析成功
+            success_msg = "解析成功"
+            if selected_qn_name:
+                success_msg = f"解析成功，已选择：{selected_qn_name}"
+            await send_text(self.ctx, success_msg, session_id, message, self.config.api)
+
+            # Step 4: 下载 + 合并（阻塞）
+            sessdata = str(config.sessdata).strip()
+            buvid3 = str(config.buvid3).strip()
+            temp_path = await loop.run_in_executor(None, download_video, info, sources, sessdata, buvid3)
+            if not temp_path:
+                await send_text(self.ctx, "视频下载失败，请稍后重试。", session_id, message, self.config.api)
+                return
+
+            self.ctx.logger.info("Video download completed: %s", temp_path)
+
+            # Step 5: 时长二次校验（使用 ffprobe）
+            video_duration = await loop.run_in_executor(None, BilibiliParser.get_video_duration, temp_path)
+            if config.enable_duration_limit and video_duration is not None:
+                if video_duration > config.max_video_duration:
+                    duration_min = int(video_duration // 60)
+                    duration_sec = int(video_duration % 60)
+                    max_min = int(config.max_video_duration // 60)
+                    max_sec = int(config.max_video_duration % 60)
+                    await send_text(
+                        self.ctx,
+                        f"视频时长超过限制：视频时长为 {duration_min}分{duration_sec}秒，"
+                        f"最大允许时长为 {max_min}分{max_sec}秒，已拒绝发送。",
+                        session_id,
+                        message,
+                        self.config.api,
+                    )
+                    await loop.run_in_executor(None, lambda: os.remove(temp_path) if os.path.exists(temp_path) else None)
+                    return
+
+            # Step 6: 文件大小检查 + 压缩（阻塞）
+            final_path = await loop.run_in_executor(
+                None, self._maybe_compress, temp_path
+            )
+
+            # Step 7: 发送
+            sent_ok = await send_video(
+                self.ctx,
+                final_path,
+                self.config.environment.runtime_mode,
+                message,
+                self.config.api,
+            )
+            if not sent_ok:
+                await send_text(self.ctx, "视频解析成功，但发送失败。请检查网络连接和API配置。", session_id, message, self.config.api)
+            else:
+                self.ctx.logger.info("Video file sent successfully")
+
+            # Step 8: 清理
+            await loop.run_in_executor(None, self._cleanup_files, final_path, temp_path)
+
+            self.ctx.logger.info("Bilibili video processing completed")
+
+        except Exception:
+            self.ctx.logger.error("视频处理异常", exc_info=True)
+            try:
+                await send_text(self.ctx, "视频处理过程中发生错误，请稍后重试。", session_id, message, self.config.api)
+            except Exception:
+                pass
+
+    # ── 同步辅助方法（在线程池中运行） ──────────────────────
+
+    def _resolve_video_sync(
+        self,
+        url: str,
+        fallback_qn: int | None,
+    ) -> tuple[BilibiliVideoInfo | None, dict[str, Any] | None, str | None, str, str | None]:
+        """同步解析视频链接（阻塞，在线程池中运行）。"""
+        # 预热 FFmpeg 缓存（check_ffmpeg_availability 幂等，结果已内部缓存）
+        ffmpeg_manager.check_ffmpeg_availability()
+
+        config_opts = {
+            "qn": BilibiliParser.safe_int(self.config.bilibili.qn),
+            "qn_strict": self.config.bilibili.qn_strict,
+            "sessdata": str(self.config.bilibili.sessdata).strip(),
+            "buvid3": str(self.config.bilibili.buvid3).strip(),
+        }
+
+        # 执行配置验证，输出警告与建议日志
+        validation_result = BilibiliParser.validate_config(config_opts)
+        if not validation_result["valid"]:
+            self.ctx.logger.error("配置验证失败，但继续尝试处理")
+        for w in validation_result["warnings"]:
+            self.ctx.logger.debug("配置警告: %s", w)
+        for r in validation_result["recommendations"]:
+            self.ctx.logger.debug("配置建议: %s", r)
+
+        target_url = url
+
+>>>>>>> Stashed changes
         # 短链接解析（带重试）
         if "b23.tv" in target_url:
             for attempt in range(3):
                 try:
+<<<<<<< Updated upstream
 <<<<<<< HEAD
                     target_url = BilibiliParser._follow_redirect(target_url)
                     break
@@ -930,6 +1066,10 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
                     await loop.run_in_executor(None, _cleanup)
                     self._logger.debug("Video files cleaned up")
 >>>>>>> 179a4a319dc6af81fac7f55a25f53670690da6af
+=======
+                    target_url = BilibiliParser._follow_redirect(target_url)
+                    break
+>>>>>>> Stashed changes
                 except Exception as e:
                     if attempt < 2:
                         time_sleep = __import__("time").sleep

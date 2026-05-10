@@ -1,8 +1,7 @@
-<<<<<<< HEAD
 {
   "manifest_version": 2,
   "id": "xinxinxin0.bilibili-video-sender",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "name": "麦麦发 B 站视频",
   "description": "让麦麦解析 B 站视频链接并发送，群聊私聊都可用",
   "author": {
@@ -30,42 +29,3 @@
     "default_locale": "zh-CN"
   }
 }
-=======
-{
-  "manifest_version": 1,
-  "name": "麦麦发 B 站视频",
-  "version": "1.4.3",
-  "description": "让麦麦解析 B 站视频链接并发送，群聊私聊都可用",
-  "author": {
-    "name": "XinxInxiN0",
-    "url": "https://github.com/XinxInxiN0"
-  },
-  "license": "MIT",
-  "host_application": {
-    "min_version": "0.9.0"
-  },
-  "homepage_url": "https://github.com/XinxInxiN0/bilibili_video_sender_plugin",
-  "repository_url": "https://github.com/XinxInxiN0/bilibili_video_sender_plugin",
-  "keywords": [
-    "bilibili",
-    "video",
-    "send"
-  ],
-  "categories": [
-    "Multimedia",
-    "Utility Tools"
-  ],
-  "default_locale": "zh-CN",
-  "plugin_info": {
-    "is_built_in": false,
-    "plugin_type": "utility",
-    "components": [],
-    "features": [
-      "自动识别 B 站链接",
-      "发送视频文件",
-      "支持 b23.tv 短链"
-    ]
-  },
-  "id": "XinxInxiN0.bilibili_video_sender_plugin"
-}
->>>>>>> 179a4a319dc6af81fac7f55a25f53670690da6af
