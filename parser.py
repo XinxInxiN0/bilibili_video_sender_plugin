@@ -132,6 +132,76 @@ class BilibiliParser:
         return BilibiliParser.QN_INFO.get(qn, f"未知({qn})")
 
     @staticmethod
+    def validate_config(options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """验证配置参数的有效性"""
+        opts = options or {}
+        validation_result: Dict[str, Any] = {"valid": True, "warnings": [], "errors": [], "recommendations": []}
+
+        # 检查Cookie配置
+        sessdata = str(opts.get("sessdata", "")).strip()
+        buvid3 = str(opts.get("buvid3", "")).strip()
+
+        if not sessdata:
+            validation_result["warnings"].append("未配置SESSDATA，将使用游客模式")
+            validation_result["recommendations"].append("建议配置SESSDATA以获得更好的清晰度和功能")
+        elif len(sessdata) < 10:
+            validation_result["errors"].append("SESSDATA长度异常，可能配置错误")
+            validation_result["valid"] = False
+        else:
+            # 尝试解析 SESSDATA 内嵌的过期时间戳（URL 解码后格式: value,timestamp,suffix）
+            try:
+                decoded = urllib.parse.unquote(sessdata)
+                parts = decoded.split(",")
+                if len(parts) >= 2:
+                    expiry_ts = int(parts[1])
+                    if 0 < expiry_ts < time.time():
+                        expire_dt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expiry_ts))
+                        warn_msg = f"SESSDATA 已过期（过期时间: {expire_dt}），B站将退回游客模式，清晰度受限，请在 config.toml 中更新 SESSDATA"
+                        validation_result["warnings"].append(warn_msg)
+                        _logger.warning(warn_msg)
+            except Exception:
+                pass
+
+        if not buvid3:
+            # buvid3 为可选项，仅影响 session 参数生成
+            validation_result["recommendations"].append("未配置Buvid3（可选），如需生成session参数可补充")
+        elif len(buvid3) < 10:
+            validation_result["warnings"].append("Buvid3长度异常，可能配置错误（非必填）")
+
+        # 检查清晰度配置
+        requested_qn = BilibiliParser.safe_int(opts.get("qn", 0))
+        strict_qn = bool(opts.get("qn_strict", False)) and requested_qn != 0
+        if requested_qn == 0:
+            effective_qn = 64 if sessdata else 32
+            qn_name = BilibiliParser.get_qn_name(effective_qn)
+            _logger.info("清晰度配置: 自动(%s) (qn=0)", qn_name)
+        else:
+            effective_qn = requested_qn
+            qn_name = BilibiliParser.get_qn_name(requested_qn)
+            if requested_qn not in BilibiliParser.QN_INFO:
+                validation_result["warnings"].append(f"qn={requested_qn} 不在常见清晰度列表，可能无效")
+            _logger.info("清晰度配置: %s (qn=%d, strict=%s)", qn_name, requested_qn, strict_qn)
+
+        if effective_qn >= 64 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}清晰度但未配置Cookie，可能失败")
+        if effective_qn >= 80 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}清晰度需要大会员账号")
+        if effective_qn >= 116 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}高帧率需要大会员账号")
+        if effective_qn >= 125 and not sessdata:
+            validation_result["warnings"].append(f"请求{qn_name}需要大会员账号")
+
+        # 记录验证结果
+        if validation_result["warnings"]:
+            _logger.debug("Config warnings: %s", validation_result["warnings"])
+        if validation_result["errors"]:
+            _logger.error("Config errors: %s", validation_result["errors"])
+        if validation_result["recommendations"]:
+            _logger.debug("Config suggestions: %s", validation_result["recommendations"])
+        _logger.debug("Config validation: %s", "pass" if validation_result["valid"] else "fail")
+        return validation_result
+
+    @staticmethod
     def _codec_rank(codecs: str) -> int:
         if not codecs:
             return 3
