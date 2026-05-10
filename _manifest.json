@@ -1,7 +1,40 @@
+<<<<<<< HEAD
+{
+  "manifest_version": 2,
+  "id": "xinxinxin0.bilibili-video-sender",
+  "version": "2.0.0",
+  "name": "麦麦发 B 站视频",
+  "description": "让麦麦解析 B 站视频链接并发送，群聊私聊都可用",
+  "author": {
+    "name": "XinxInxiN0",
+    "url": "https://github.com/XinxInxiN0"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/XinxInxiN0/bilibili_video_sender_plugin"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "2.0.0"
+  },
+  "sdk": {
+    "min_version": "2.3.0",
+    "max_version": "2.99.0"
+  },
+  "capabilities": [
+    "send.text",
+    "send.custom",
+    "config.get"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN"
+  }
+}
+=======
 {
   "manifest_version": 1,
   "name": "麦麦发 B 站视频",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "让麦麦解析 B 站视频链接并发送，群聊私聊都可用",
   "author": {
     "name": "XinxInxiN0",
@@ -35,3 +68,4 @@
   },
   "id": "XinxInxiN0.bilibili_video_sender_plugin"
 }
+>>>>>>> 179a4a319dc6af81fac7f55a25f53670690da6af

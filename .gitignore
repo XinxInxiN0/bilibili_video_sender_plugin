@@ -8,3 +8,7 @@ config.toml
 /tests
 pytest.ini
 tmp/
+/.claude
+CLAUDE.md
+migration-guide.md
+guide.md

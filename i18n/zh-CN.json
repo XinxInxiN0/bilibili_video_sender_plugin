@@ -1,0 +1,5 @@
+{
+  "plugin.name": "麦麦发 B 站视频",
+  "plugin.description": "让麦麦解析 B 站视频链接并发送，群聊私聊都可用",
+  "handler.bilibili_auto_send": "解析B站视频链接并发送视频"
+}
