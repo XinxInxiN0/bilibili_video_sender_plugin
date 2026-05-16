@@ -82,8 +82,3 @@ PluginConfig
 ## 配置修改原则
 
 修改 `config.toml` 时只需更新模版文件，并同步更新版本号注释行（`# 配置版本: x.x.x`）。无需为配置变更编写测试文件。
-
-<!-- SPECKIT START -->
-For additional context about technologies to be used, project structure,
-shell commands, and other important information, read the current plan
-<!-- SPECKIT END -->
