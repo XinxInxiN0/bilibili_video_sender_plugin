@@ -1,12 +1,6 @@
-data/split
 __pycache__
-config.toml
-*.toml
 config.toml.backup
 config.toml
-/.kilocode
-tmp/
 /.claude
-CLAUDE.md
 migration-guide.md
 guide.md
