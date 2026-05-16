@@ -261,6 +261,22 @@ class BilibiliParser:
         return best_video, selected_qn, "fallback" if fallback else "ok"
 
     @staticmethod
+    def _extract_refreshed_sessdata(response_headers: Any, current_sessdata: str) -> Optional[str]:
+        """从响应 Set-Cookie 中提取 B站刷新的 SESSDATA（与当前值不同时才返回）。"""
+        try:
+            cookies = response_headers.get_all("Set-Cookie") or []
+            for cookie in cookies:
+                for part in cookie.split(";"):
+                    part = part.strip()
+                    if part.upper().startswith("SESSDATA="):
+                        value = part[len("SESSDATA="):].strip()
+                        if value and value.lower() != "deleted" and value != current_sessdata:
+                            return value
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
     def _build_request(url: str, headers: Optional[Dict[str, str]] = None) -> urllib.request.Request:
         default_headers = {
             "User-Agent": BilibiliParser.USER_AGENT,
@@ -444,6 +460,12 @@ class BilibiliParser:
             req = BilibiliParser._build_request(api, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public API
                 data_bytes = resp.read()
+                # 捕获 B站可能刷新的 SESSDATA（rolling session）
+                refreshed = BilibiliParser._extract_refreshed_sessdata(resp.headers, sessdata)
+                if refreshed:
+                    opts["sessdata"] = refreshed
+                    opts["sessdata_refreshed"] = True
+                    _logger.info("SESSDATA 已由 B站自动刷新")
         except Exception as e:
             _logger.error("HTTP请求失败: %s", e)
             return None, f"网络请求失败: {e}"
@@ -527,6 +549,17 @@ class BilibiliParser:
                     "Quality downgrade: requested %s (qn=%d), selected %s (qn=%d)",
                     BilibiliParser.get_qn_name(requested_qn),
                     requested_qn,
+                    selected_name,
+                    selected_qn,
+                )
+            elif requested_qn == 0 and selected_qn != qn:
+                # 自动模式：effective target 是 qn，但实际只拿到 selected_qn（低于预期）
+                # 通常因为 SESSDATA 过期或权限不足，B站退回游客级别的流
+                _logger.warning(
+                    "自动清晰度降级: 期望 %s (qn=%d)，实际获得 %s (qn=%d)，"
+                    "SESSDATA 可能已过期或账号权限不足，请在 config.toml 中更新 SESSDATA",
+                    BilibiliParser.get_qn_name(qn),
+                    qn,
                     selected_name,
                     selected_qn,
                 )
@@ -639,6 +672,12 @@ class BilibiliParser:
             req = BilibiliParser._build_request(api, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public API
                 data_bytes = resp.read()
+                # 捕获 B站可能刷新的 SESSDATA（rolling session）
+                refreshed = BilibiliParser._extract_refreshed_sessdata(resp.headers, sessdata)
+                if refreshed:
+                    opts["sessdata"] = refreshed
+                    opts["sessdata_refreshed"] = True
+                    _logger.info("Force DASH: SESSDATA 已由 B站自动刷新")
         except Exception as e:
             _logger.error("Force DASH HTTP error: %s", e)
             return None, f"Force DASH network error: {e}"
@@ -719,6 +758,16 @@ class BilibiliParser:
                     "Force DASH quality downgrade: requested %s (qn=%d), selected %s (qn=%d)",
                     BilibiliParser.get_qn_name(requested_qn),
                     requested_qn,
+                    selected_name,
+                    selected_qn,
+                )
+            elif requested_qn == 0 and selected_qn != qn:
+                # 自动模式：effective target 是 qn，但实际只拿到 selected_qn（低于预期）
+                _logger.warning(
+                    "Force DASH 自动清晰度降级: 期望 %s (qn=%d)，实际获得 %s (qn=%d)，"
+                    "SESSDATA 可能已过期或账号权限不足，请在 config.toml 中更新 SESSDATA",
+                    BilibiliParser.get_qn_name(qn),
+                    qn,
                     selected_name,
                     selected_qn,
                 )
