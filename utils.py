@@ -36,6 +36,21 @@ def get_download_temp_dir() -> str:
     return os.path.join(plugin_dir, "tmp")
 
 
+def ensure_shared_file_permissions(file_path: str) -> None:
+    """确保下载产物可被 NapCat 等独立进程读取。"""
+    if platform.system().lower() == "windows":
+        return
+
+    try:
+        parent_dir = os.path.dirname(file_path)
+        if parent_dir and os.path.isdir(parent_dir):
+            os.chmod(parent_dir, 0o755)
+        if os.path.isfile(file_path):
+            os.chmod(file_path, 0o644)
+    except Exception as e:
+        _logger.warning("Failed to update shared file permissions: %s", e)
+
+
 def convert_windows_to_wsl_path(windows_path: str) -> str:
     """将 Windows 路径转换为 WSL 路径。
 

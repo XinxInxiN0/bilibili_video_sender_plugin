@@ -14,7 +14,7 @@ from .downloader import download_video
 from .ffmpeg import VideoCompressor, ffmpeg_manager
 from .parser import BilibiliParser, BilibiliVideoInfo
 from .sender import send_text, send_video
-from .utils import get_download_temp_dir
+from .utils import ensure_shared_file_permissions, get_download_temp_dir
 
 
 # ── 配置模型 ─────────────────────────────────────────────────
@@ -310,6 +310,7 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             final_path = await loop.run_in_executor(
                 None, self._maybe_compress, temp_path
             )
+            await loop.run_in_executor(None, ensure_shared_file_permissions, final_path)
 
             # Step 7: 发送
             sent_ok = await send_video(
