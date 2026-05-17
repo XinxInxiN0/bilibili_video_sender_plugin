@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "xinxinxin0.bilibili-video-sender",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "name": "麦麦发 B 站视频",
   "description": "让麦麦解析 B 站视频链接并发送，群聊私聊都可用",
   "author": {

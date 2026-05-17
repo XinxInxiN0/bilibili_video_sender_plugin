@@ -71,6 +71,10 @@ class EnvironmentConfig(PluginConfigBase):
         default="windows",
         description="运行环境模式：windows = 纯 Windows 环境 | wsl = WSL 混合环境 | linux = 纯 Linux 环境",
     )
+    linux_temp_dir: str = Field(
+        default="",
+        description="Linux 自定义视频临时目录（留空则使用插件目录 tmp；建议填写 NapCat 可读取的目录，如 /var/tmp/maibot_bilibili）",
+    )
 
 
 class ApiConfig(PluginConfigBase):
@@ -88,7 +92,7 @@ class PluginMetaConfig(PluginConfigBase):
     __ui_label__ = "插件设置"
     __ui_order__ = 0
 
-    config_version: str = Field(default="2.0.2", description="配置版本（勿手动修改）")
+    config_version: str = Field(default="2.0.3", description="配置版本（勿手动修改）")
     enabled: bool = Field(default=True, description="是否启用插件")
 
 
@@ -133,7 +137,7 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
     async def on_unload(self) -> None:
         """插件卸载：清理临时文件。"""
         self.ctx.logger.info("Bilibili video sender plugin unloading...")
-        tmp_dir = get_download_temp_dir()
+        tmp_dir = get_download_temp_dir(self.config.environment.linux_temp_dir)
         try:
             for f in os.listdir(tmp_dir):
                 fpath = os.path.join(tmp_dir, f)
@@ -280,7 +284,9 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             # Step 4: 下载 + 合并（阻塞）
             sessdata = str(config.sessdata).strip()
             buvid3 = str(config.buvid3).strip()
-            temp_path = await loop.run_in_executor(None, download_video, info, sources, sessdata, buvid3)
+            temp_path = await loop.run_in_executor(
+                None, download_video, info, sources, sessdata, buvid3, self.config.environment.linux_temp_dir
+            )
             if not temp_path:
                 await send_text(self.ctx, "视频下载失败，请稍后重试。", session_id, message, self.config.api)
                 return

@@ -27,10 +27,13 @@ def is_running_in_docker() -> bool:
         return False
 
 
-def get_download_temp_dir() -> str:
+def get_download_temp_dir(linux_temp_dir: str = "") -> str:
     """获取下载临时目录：优先使用共享目录，确保跨进程访问。"""
     if is_running_in_docker():
         return "/MaiMBot/data/tmp"
+
+    if platform.system().lower() == "linux" and str(linux_temp_dir).strip():
+        return os.path.abspath(os.path.expanduser(str(linux_temp_dir).strip()))
 
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(plugin_dir, "tmp")
