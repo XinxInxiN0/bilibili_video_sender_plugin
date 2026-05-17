@@ -88,7 +88,7 @@ class PluginMetaConfig(PluginConfigBase):
     __ui_label__ = "插件设置"
     __ui_order__ = 0
 
-    config_version: str = Field(default="2.0.1", description="配置版本（勿手动修改）")
+    config_version: str = Field(default="2.0.2", description="配置版本（勿手动修改）")
     enabled: bool = Field(default=True, description="是否启用插件")
 
 
