@@ -32,9 +32,6 @@ def get_download_temp_dir() -> str:
     if is_running_in_docker():
         return "/MaiMBot/data/tmp"
 
-    if platform.system().lower() == "linux":
-        return "/tmp/maibot_bilibili"
-
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(plugin_dir, "tmp")
 
