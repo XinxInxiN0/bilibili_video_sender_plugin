@@ -180,6 +180,7 @@ def download_video(
     sources: Dict[str, Any],
     sessdata: str,
     buvid3: str,
+    linux_temp_dir: str = "",
 ) -> Optional[str]:
     """下载视频并合并为 mp4 文件（阻塞函数，应在线程池中运行）。
 
@@ -190,7 +191,7 @@ def download_video(
         safe_title = sanitize_filename(info.title)
         unique_tag = f"{info.aid}_{info.cid}_{int(time.time() * 1000)}"
         base_name = f"{safe_title}_{unique_tag}"
-        tmp_dir = get_download_temp_dir()
+        tmp_dir = get_download_temp_dir(linux_temp_dir)
         os.makedirs(tmp_dir, exist_ok=True)
 
         temp_path = os.path.join(tmp_dir, f"{base_name}.mp4")
@@ -290,4 +291,3 @@ def download_video(
     except Exception as e:
         _logger.error("Failed to download video: %s", e)
         return None
-
