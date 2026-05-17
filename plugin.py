@@ -112,6 +112,7 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
     config_reload_subscriptions: tuple[str, ...] = ()
 
     _bot_qq: str = ""
+    _cached_sessdata: str = ""  # 运行时内存缓存，B站 rolling session 刷新后更新
 
     async def on_load(self) -> None:
         """插件加载：预热 FFmpeg 缓存。"""
@@ -346,10 +347,12 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         # 预热 FFmpeg 缓存（check_ffmpeg_availability 幂等，结果已内部缓存）
         ffmpeg_manager.check_ffmpeg_availability()
 
+        # 优先使用内存缓存的 SESSDATA（B站 rolling session 刷新后更新）
+        effective_sessdata = self._cached_sessdata or str(self.config.bilibili.sessdata).strip()
         config_opts = {
             "qn": BilibiliParser.safe_int(self.config.bilibili.qn),
             "qn_strict": self.config.bilibili.qn_strict,
-            "sessdata": str(self.config.bilibili.sessdata).strip(),
+            "sessdata": effective_sessdata,
             "buvid3": str(self.config.bilibili.buvid3).strip(),
         }
 
@@ -412,6 +415,14 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         if not sources:
             return info, None, None, "error", f"解析失败：{status}"
 
+        # 若 B站在响应中刷新了 SESSDATA，更新内存缓存并持久化到 config.toml
+        if config_opts.get("sessdata_refreshed"):
+            new_sessdata = config_opts.get("sessdata", "")
+            if new_sessdata:
+                self._cached_sessdata = new_sessdata
+                self.ctx.logger.info("SESSDATA 内存缓存已更新（B站 rolling session）")
+                self._save_sessdata_to_config(new_sessdata)
+
         selected_qn_name = config_opts.get("selected_qn_name")
         return info, sources, selected_qn_name, status, None
 
@@ -454,6 +465,35 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             return compressed_path
 
         return temp_path
+
+    def _save_sessdata_to_config(self, new_sessdata: str) -> None:
+        """将 B站刷新的 SESSDATA 写回 config.toml，供插件重启后继续使用。"""
+        try:
+            config_path = os.path.join(os.path.dirname(__file__), "config.toml")
+            if not os.path.exists(config_path):
+                self.ctx.logger.warning("config.toml 不存在，SESSDATA 仅保留在内存缓存")
+                return
+            with open(config_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            in_bilibili = False
+            updated = False
+            new_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped.startswith("["):
+                    in_bilibili = (stripped == "[bilibili]")
+                if in_bilibili and not updated and re.match(r"\s*sessdata\s*=", line):
+                    line = re.sub(r'(".*?"|\'.*?\')', f'"{new_sessdata}"', line, count=1)
+                    updated = True
+                new_lines.append(line)
+            if updated:
+                with open(config_path, "w", encoding="utf-8") as f:
+                    f.writelines(new_lines)
+                self.ctx.logger.info("SESSDATA 已持久化到 config.toml")
+            else:
+                self.ctx.logger.warning("config.toml 中未找到 [bilibili].sessdata，无法持久化")
+        except Exception as e:
+            self.ctx.logger.warning("持久化 SESSDATA 失败: %s", e)
 
     @staticmethod
     def _cleanup_files(final_path: str, temp_path: str) -> None:
