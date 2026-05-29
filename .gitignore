@@ -4,3 +4,4 @@ config.toml
 /.claude
 migration-guide.md
 guide.md
+/config_back
