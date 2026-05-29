@@ -14,7 +14,7 @@ import aiohttp
 from .utils import convert_windows_to_wsl_path
 
 if TYPE_CHECKING:
-    from .plugin import ApiConfig
+    from ..plugin import ApiConfig
 
 _logger = logging.getLogger("plugin.bilibili_video_sender.sender")
 

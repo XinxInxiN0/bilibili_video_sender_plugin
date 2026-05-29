@@ -9,6 +9,8 @@ import shutil
 import subprocess
 from typing import Any, Dict, List, Optional
 
+from .utils import get_plugin_root_dir
+
 _logger = logging.getLogger("plugin.bilibili_video_sender.ffmpeg")
 
 
@@ -16,7 +18,7 @@ class FFmpegManager:
     """跨平台 FFmpeg 管理器。"""
 
     def __init__(self):
-        self.plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        self.plugin_dir = get_plugin_root_dir()
         self.system = platform.system().lower()
         self.ffmpeg_dir = os.path.join(self.plugin_dir, "ffmpeg")
 

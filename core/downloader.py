@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+from .auth import build_cookie_header, normalize_credentials
 from .ffmpeg import ffmpeg_manager
 from .parser import BilibiliParser
 from .utils import ProgressBar, get_download_temp_dir, sanitize_filename
@@ -178,8 +179,7 @@ def _remux_to_mp4(input_path: str, output_path: str, ffmpeg_path: str) -> bool:
 def download_video(
     info: Any,  # BilibiliVideoInfo
     sources: Dict[str, Any],
-    sessdata: str,
-    buvid3: str,
+    credentials: Dict[str, Any] | str,
     linux_temp_dir: str = "",
 ) -> Optional[str]:
     """下载视频并合并为 mp4 文件（阻塞函数，应在线程池中运行）。
@@ -208,11 +208,12 @@ def download_video(
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Range": "bytes=0-",
         }
-        if sessdata:
-            cookie_parts = [f"SESSDATA={sessdata}"]
-            if buvid3:
-                cookie_parts.append(f"buvid3={buvid3}")
-            headers["Cookie"] = "; ".join(cookie_parts)
+        if isinstance(credentials, str):
+            cookie_header = credentials.strip()
+        else:
+            cookie_header = build_cookie_header(normalize_credentials(credentials))
+        if cookie_header:
+            headers["Cookie"] = cookie_header
             _logger.debug("Cookie auth added for download")
         else:
             _logger.debug("No Cookie for download, may get 403 error")
