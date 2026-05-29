@@ -44,7 +44,7 @@ class ParserConfig(PluginConfigBase):
     __ui_label__ = "解析器设置"
     __ui_order__ = 2
 
-    enable_miniapp_card: bool = Field(default=False, description="是否允许解析 B 站小卡片")
+    enable_miniapp_card: bool = Field(default=True, description="是否允许解析 B 站小卡片")
 
 
 class FFmpegConfig(PluginConfigBase):
@@ -92,7 +92,7 @@ class PluginMetaConfig(PluginConfigBase):
     __ui_label__ = "插件设置"
     __ui_order__ = 0
 
-    config_version: str = Field(default="2.0.3", description="配置版本（勿手动修改）")
+    config_version: str = Field(default="2.0.4", description="配置版本（勿手动修改）")
     enabled: bool = Field(default=True, description="是否启用插件")
 
 
@@ -186,23 +186,10 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         parse_source = processed_plain_text
 
         if self.config.parser.enable_miniapp_card:
-            for seg in message_segments:
-                # SDK 2.0 消息段均为 dict；未知类型（含小卡片）序列化为 type="dict"
-                if not isinstance(seg, dict):
-                    continue
-                if seg.get("type", "") != "dict":
-                    continue
-                seg_data = seg.get("data", {})
-                if not isinstance(seg_data, dict):
-                    continue
-                source_url = str(seg_data.get("source_url", "") or "")
-                if not source_url:
-                    continue
-                miniapp_url = BilibiliParser.find_first_bilibili_url(source_url)
-                if miniapp_url:
-                    parse_source = source_url
-                    url = miniapp_url
-                    break
+            miniapp_url = self._extract_miniapp_bilibili_url(message)
+            if miniapp_url:
+                parse_source = miniapp_url
+                url = miniapp_url
 
         if not url:
             url = BilibiliParser.find_first_bilibili_url(processed_plain_text) or ""
@@ -230,6 +217,64 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         if config.block_ai_reply:
             return {"action": "abort"}
         return None
+
+    def _extract_miniapp_bilibili_url(self, message: dict[str, Any]) -> str:
+        """从平台适配器透传的小程序卡片 metadata 中提取 B 站链接。"""
+
+        message_info = message.get("message_info", {})
+        if not isinstance(message_info, dict):
+            return ""
+
+        additional_config = message_info.get("additional_config", {})
+        if not isinstance(additional_config, dict):
+            return ""
+
+        platform_card_payloads = additional_config.get("platform_card_payloads", [])
+        if not isinstance(platform_card_payloads, list):
+            return ""
+
+        for card_payload in platform_card_payloads:
+            if not isinstance(card_payload, dict):
+                continue
+            if card_payload.get("type") != "miniapp_card":
+                continue
+            if miniapp_url := self._find_bilibili_url_in_payload(card_payload.get("payload")):
+                return miniapp_url
+        return ""
+
+    def _find_bilibili_url_in_payload(self, payload: Any) -> str:
+        """递归扫描卡片载荷，兼容不同 NapCat/OneBot 字段名。"""
+
+        if isinstance(payload, dict):
+            for field_name in (
+                "source_url",
+                "qqdocurl",
+                "jumpUrl",
+                "jump_url",
+                "webUrl",
+                "web_url",
+                "pageUrl",
+                "page_url",
+                "url",
+            ):
+                value = str(payload.get(field_name) or "").strip()
+                if miniapp_url := BilibiliParser.find_first_bilibili_url(value):
+                    return miniapp_url
+            for value in payload.values():
+                if miniapp_url := self._find_bilibili_url_in_payload(value):
+                    return miniapp_url
+            return ""
+
+        if isinstance(payload, list):
+            for item in payload:
+                if miniapp_url := self._find_bilibili_url_in_payload(item):
+                    return miniapp_url
+            return ""
+
+        if isinstance(payload, str):
+            return BilibiliParser.find_first_bilibili_url(payload) or ""
+
+        return ""
 
     # ── 视频处理流水线 ────────────────────────────────────
 
