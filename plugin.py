@@ -10,24 +10,47 @@ from typing import Any
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import HookMode, HookOrder
 
-from .downloader import download_video
-from .ffmpeg import VideoCompressor, ffmpeg_manager
-from .parser import BilibiliParser, BilibiliVideoInfo
-from .sender import send_text, send_video
-from .utils import ensure_shared_file_permissions, get_download_temp_dir
+from .core.auth import (
+    AUTH_CONFIG_FIELD_NAMES,
+    BilibiliAuthRefresher,
+    build_cookie_header,
+    has_login_cookie,
+    normalize_credentials,
+    save_auth_config,
+)
+from .core.downloader import download_video
+from .core.ffmpeg import VideoCompressor, ffmpeg_manager
+from .core.parser import BilibiliParser, BilibiliVideoInfo
+from .core.sender import send_text, send_video
+from .core.utils import ensure_shared_file_permissions, get_download_temp_dir
 
 
 # ── 配置模型 ─────────────────────────────────────────────────
+
+
+class BilibiliAuthConfig(PluginConfigBase):
+    """B站登录凭据配置。"""
+    __ui_label__ = "B站认证"
+    __ui_icon__ = "key"
+    __ui_order__ = 1
+
+    SESSDATA: str = Field(default="", description="B站 SESSDATA Cookie")
+    bili_jct: str = Field(default="", description="B站 bili_jct Cookie")
+    DedeUserID: str = Field(default="", description="B站 DedeUserID Cookie")
+    DedeUserID__ckMd5: str = Field(default="", description="B站 DedeUserID__ckMd5 Cookie")
+    sid: str = Field(default="", description="B站 sid Cookie")
+    buvid3: str = Field(default="", description="B站 buvid3 Cookie")
+    buvid4: str = Field(default="", description="B站 buvid4 Cookie")
+    ac_time_value: str = Field(default="", description="B站 Local Storage 中的 ac_time_value")
 
 
 class BilibiliConfig(PluginConfigBase):
     """B站 API 与视频处理配置。"""
     __ui_label__ = "B站设置"
     __ui_icon__ = "videocam"
-    __ui_order__ = 1
+    __ui_order__ = 2
 
-    sessdata: str = Field(default="", description="B 站登录 Cookie 中的 SESSDATA 值（用于获取高清晰度视频）")
-    buvid3: str = Field(default="", description="B 站设备标识 Buvid3（可选，用于生成 session 参数）")
+    enable_cookie_refresh: bool = Field(default=True, description="是否启用 B 站 Cookie 主动续期")
     qn: int = Field(default=0, description="清晰度设置(qn)，0 为自动（登录默认 720P，未登录默认 480P）", ge=0)
     qn_strict: bool = Field(default=False, description="是否严格按 qn 选择清晰度")
     group_at_only: bool = Field(default=False, description="群聊中仅当被 @ 时才处理 B 站链接")
@@ -42,7 +65,7 @@ class BilibiliConfig(PluginConfigBase):
 class ParserConfig(PluginConfigBase):
     """解析器配置。"""
     __ui_label__ = "解析器设置"
-    __ui_order__ = 2
+    __ui_order__ = 3
 
     enable_miniapp_card: bool = Field(default=True, description="是否允许解析 B 站小卡片")
 
@@ -51,7 +74,7 @@ class FFmpegConfig(PluginConfigBase):
     """FFmpeg 相关配置。"""
     __ui_label__ = "FFmpeg设置"
     __ui_icon__ = "build"
-    __ui_order__ = 3
+    __ui_order__ = 4
 
     show_warnings: bool = Field(default=True, description="是否显示 FFmpeg 相关警告信息")
     enable_hardware_acceleration: bool = Field(default=True, description="是否启用硬件加速自动检测")
@@ -65,7 +88,7 @@ class FFmpegConfig(PluginConfigBase):
 class EnvironmentConfig(PluginConfigBase):
     """运行环境配置。"""
     __ui_label__ = "环境设置"
-    __ui_order__ = 4
+    __ui_order__ = 5
 
     runtime_mode: str = Field(
         default="windows",
@@ -80,7 +103,7 @@ class EnvironmentConfig(PluginConfigBase):
 class ApiConfig(PluginConfigBase):
     """OneBot API 配置（视频发送 fallback 用）。"""
     __ui_label__ = "API设置"
-    __ui_order__ = 5
+    __ui_order__ = 6
 
     host: str = Field(default="127.0.0.1", description="OneBot HTTP API 主机名/地址")
     port: int = Field(default=5700, description="OneBot HTTP API 端口号", ge=1, le=65535)
@@ -92,13 +115,14 @@ class PluginMetaConfig(PluginConfigBase):
     __ui_label__ = "插件设置"
     __ui_order__ = 0
 
-    config_version: str = Field(default="2.0.4", description="配置版本（勿手动修改）")
+    config_version: str = Field(default="2.0.6", description="配置版本（勿手动修改）")
     enabled: bool = Field(default=True, description="是否启用插件")
 
 
 class PluginConfig(PluginConfigBase):
     """插件总配置。"""
     plugin: PluginMetaConfig = Field(default_factory=PluginMetaConfig)
+    auth: BilibiliAuthConfig = Field(default_factory=BilibiliAuthConfig)
     bilibili: BilibiliConfig = Field(default_factory=BilibiliConfig)
     parser: ParserConfig = Field(default_factory=ParserConfig)
     ffmpeg: FFmpegConfig = Field(default_factory=FFmpegConfig)
@@ -116,13 +140,23 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
     config_reload_subscriptions: tuple[str, ...] = ()
 
     _bot_qq: str = ""
-    _cached_sessdata: str = ""  # 运行时内存缓存，B站 rolling session 刷新后更新
 
     async def on_load(self) -> None:
         """插件加载：预热 FFmpeg 缓存。"""
         self.ctx.logger.info("Bilibili video sender plugin loading...")
+        self._auth_lock = asyncio.Lock()
+        self._config_path = os.path.join(os.path.dirname(__file__), "config.toml")
+        self._auth_credentials = self._credentials_from_config()
+        if has_login_cookie(self._auth_credentials):
+            self.ctx.logger.info("B站登录凭据已从 config.toml [auth] 加载")
+        else:
+            self.ctx.logger.warning("config.toml [auth] 未配置 SESSDATA，将使用游客模式")
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, ffmpeg_manager.check_ffmpeg_availability)
+        if self.config.bilibili.enable_cookie_refresh and not BilibiliAuthRefresher.cryptography_available():
+            self.ctx.logger.warning(
+                "未安装 cryptography，B站 Cookie 主动续期已禁用；可执行 pip install cryptography 启用高清登录态续期"
+            )
 
         # 获取 bot QQ 账号用于 @ 检测
         try:
@@ -154,6 +188,89 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         """配置热更新回调。"""
         if scope == CONFIG_RELOAD_SCOPE_SELF:
             self.ctx.logger.info("Plugin config updated to version %s", version)
+            self._auth_credentials = self._credentials_from_config()
+
+    def _credentials_from_config(self) -> dict[str, Any]:
+        """从 config.toml 的 [auth] 段构造 B站登录凭据。"""
+        auth_config = getattr(self.config, "auth", None)
+        if auth_config is None:
+            return {}
+        return normalize_credentials(
+            {name: str(getattr(auth_config, name, "") or "").strip() for name in AUTH_CONFIG_FIELD_NAMES}
+        )
+
+    def _update_auth_config_instance(self, credentials: dict[str, Any]) -> None:
+        """同步强类型配置实例，保证当前进程后续使用最新 Cookie。"""
+        auth_config = getattr(self.config, "auth", None)
+        if auth_config is None:
+            return
+        for name in AUTH_CONFIG_FIELD_NAMES:
+            try:
+                setattr(auth_config, name, str(credentials.get(name, "") or ""))
+            except Exception:
+                pass
+
+    async def _persist_auth(self, credentials: dict[str, Any]) -> None:
+        loop = asyncio.get_running_loop()
+        normalized = normalize_credentials(credentials)
+        self._auth_credentials = normalized
+        self._update_auth_config_instance(normalized)
+        config_path = getattr(self, "_config_path", os.path.join(os.path.dirname(__file__), "config.toml"))
+        await loop.run_in_executor(None, save_auth_config, config_path, normalized)
+
+    async def _ensure_auth_ready(self) -> tuple[dict[str, Any], str | None]:
+        """按需刷新 B站登录凭据，返回本轮应使用的凭据和可选用户提示。"""
+        credentials = normalize_credentials(getattr(self, "_auth_credentials", {}))
+        if not self.config.bilibili.enable_cookie_refresh or not has_login_cookie(credentials):
+            return credentials, None
+
+        loop = asyncio.get_running_loop()
+        check = await loop.run_in_executor(None, BilibiliAuthRefresher.check_refresh, credentials)
+        if check.status == "ok":
+            return credentials, None
+        if check.status == "guest":
+            return {}, None
+        if check.status in {"invalid"}:
+            return {}, "B站登录凭据已失效，请管理员重新获取并更新 config.toml 的 [auth]。"
+        if check.status != "refresh_required":
+            self.ctx.logger.warning("B站登录态检查失败，继续尝试使用现有凭据: %s", check.message)
+            return credentials, None
+
+        missing = [name for name in ("bili_jct", "ac_time_value") if not credentials.get(name)]
+        if missing:
+            return (
+                credentials,
+                f"B站 Cookie 需要续期，但 config.toml [auth] 缺少 {', '.join(missing)}；请管理员补全 B站登录凭据。",
+            )
+
+        if not BilibiliAuthRefresher.cryptography_available():
+            return (
+                credentials,
+                "B站 Cookie 需要续期，但当前环境缺少 cryptography；请管理员执行 pip install cryptography 后重启插件。",
+            )
+
+        snapshot_token = str(credentials.get("ac_time_value", ""))
+        snapshot_updated = str(credentials.get("updated_at", ""))
+        async with self._auth_lock:
+            current = normalize_credentials(getattr(self, "_auth_credentials", {}))
+            if (
+                str(current.get("ac_time_value", "")) != snapshot_token
+                or str(current.get("updated_at", "")) != snapshot_updated
+            ):
+                return current, None
+
+            result = await loop.run_in_executor(None, BilibiliAuthRefresher.refresh_if_needed, current)
+            if result.ok:
+                if result.credentials:
+                    await self._persist_auth(result.credentials)
+                if result.refreshed:
+                    self.ctx.logger.info("B站 Cookie 已主动续期并写入 config.toml [auth]")
+                return normalize_credentials(getattr(self, "_auth_credentials", {})), None
+
+            self.ctx.logger.warning("B站 Cookie 续期失败: status=%s, message=%s", result.status, result.message)
+            if result.status == "dependency_missing":
+                return current, "B站 Cookie 需要续期，但当前环境缺少 cryptography；请管理员执行 pip install cryptography。"
+            return {}, "B站登录凭据已过期或触发风控，请管理员重新获取并更新 config.toml 的 [auth]。"
 
     # ── Hook 拦截 ─────────────────────────────────────────
     # chat.receive.after_process 在 message.process() 之后、maisaka 路由之前触发。
@@ -289,10 +406,13 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         config = self.config.bilibili
         try:
             loop = asyncio.get_running_loop()
+            credentials, auth_notice = await self._ensure_auth_ready()
+            if auth_notice:
+                await send_text(self.ctx, auth_notice, session_id, message, self.config.api)
 
             # Step 1: 解析视频信息 + 获取播放地址（阻塞）
-            info, sources, selected_qn_name, status, error_msg = await loop.run_in_executor(
-                None, self._resolve_video_sync, url, fallback_qn
+            info, sources, selected_qn_name, status, error_msg, updated_credentials = await loop.run_in_executor(
+                None, self._resolve_video_sync, url, fallback_qn, credentials
             )
 
             if status == "unsupported_type":
@@ -302,6 +422,11 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             if not info or not sources:
                 await send_text(self.ctx, error_msg or "未能解析该视频链接，请稍后重试。", session_id, message, self.config.api)
                 return
+
+            if updated_credentials and normalize_credentials(updated_credentials) != normalize_credentials(credentials):
+                await self._persist_auth(updated_credentials)
+                credentials = normalize_credentials(updated_credentials)
+                self.ctx.logger.info("B站响应头更新的 Cookie 已写入 config.toml [auth]")
 
             # Step 2: 时长校验
             if config.enable_duration_limit and info.duration is not None:
@@ -327,10 +452,8 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             await send_text(self.ctx, success_msg, session_id, message, self.config.api)
 
             # Step 4: 下载 + 合并（阻塞）
-            sessdata = str(config.sessdata).strip()
-            buvid3 = str(config.buvid3).strip()
             temp_path = await loop.run_in_executor(
-                None, download_video, info, sources, sessdata, buvid3, self.config.environment.linux_temp_dir
+                None, download_video, info, sources, credentials, self.config.environment.linux_temp_dir
             )
             if not temp_path:
                 await send_text(self.ctx, "视频下载失败，请稍后重试。", session_id, message, self.config.api)
@@ -394,18 +517,20 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         self,
         url: str,
         fallback_qn: int | None,
-    ) -> tuple[BilibiliVideoInfo | None, dict[str, Any] | None, str | None, str, str | None]:
+        credentials: dict[str, Any],
+    ) -> tuple[BilibiliVideoInfo | None, dict[str, Any] | None, str | None, str, str | None, dict[str, Any] | None]:
         """同步解析视频链接（阻塞，在线程池中运行）。"""
         # 预热 FFmpeg 缓存（check_ffmpeg_availability 幂等，结果已内部缓存）
         ffmpeg_manager.check_ffmpeg_availability()
 
-        # 优先使用内存缓存的 SESSDATA（B站 rolling session 刷新后更新）
-        effective_sessdata = self._cached_sessdata or str(self.config.bilibili.sessdata).strip()
+        effective_credentials = normalize_credentials(credentials)
         config_opts = {
             "qn": BilibiliParser.safe_int(self.config.bilibili.qn),
             "qn_strict": self.config.bilibili.qn_strict,
-            "sessdata": effective_sessdata,
-            "buvid3": str(self.config.bilibili.buvid3).strip(),
+            "credentials": effective_credentials,
+            "cookie_header": build_cookie_header(effective_credentials),
+            "sessdata": str(effective_credentials.get("SESSDATA", "")),
+            "buvid3": str(effective_credentials.get("buvid3", "")),
         }
 
         # 执行配置验证，输出警告与建议日志
@@ -439,7 +564,7 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         has_bv = BilibiliParser._extract_bvid(target_url) is not None
         has_av = re.search(r"/video/av\d+", target_url) is not None
         if not (has_bv or has_av):
-            return None, None, None, "unsupported_type", None
+            return None, None, None, "unsupported_type", None, None
 
         # URL 参数覆盖 qn
         url_qn = BilibiliParser.extract_qn_param(target_url)
@@ -461,22 +586,17 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
                 __import__("time").sleep(attempt + 1)
 
         if not info:
-            return None, None, None, "error", f"未能解析该视频链接，请稍后重试。"
+            return None, None, None, "error", f"未能解析该视频链接，请稍后重试。", None
 
         sources, status = BilibiliParser.get_play_urls(info.aid, info.cid, config_opts)
         if not sources:
-            return info, None, None, "error", f"解析失败：{status}"
+            return info, None, None, "error", f"解析失败：{status}", None
 
-        # 若 B站在响应中刷新了 SESSDATA，更新内存缓存并持久化到 config.toml
-        if config_opts.get("sessdata_refreshed"):
-            new_sessdata = config_opts.get("sessdata", "")
-            if new_sessdata:
-                self._cached_sessdata = new_sessdata
-                self.ctx.logger.info("SESSDATA 内存缓存已更新（B站 rolling session）")
-                self._save_sessdata_to_config(new_sessdata)
-
+        updated_credentials = normalize_credentials(config_opts.get("credentials"))
+        if not config_opts.get("auth_refreshed"):
+            updated_credentials = None
         selected_qn_name = config_opts.get("selected_qn_name")
-        return info, sources, selected_qn_name, status, None
+        return info, sources, selected_qn_name, status, None, updated_credentials
 
     def _maybe_compress(self, temp_path: str) -> str:
         """按需压缩视频（同步，在线程池中运行）。"""
@@ -517,35 +637,6 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             return compressed_path
 
         return temp_path
-
-    def _save_sessdata_to_config(self, new_sessdata: str) -> None:
-        """将 B站刷新的 SESSDATA 写回 config.toml，供插件重启后继续使用。"""
-        try:
-            config_path = os.path.join(os.path.dirname(__file__), "config.toml")
-            if not os.path.exists(config_path):
-                self.ctx.logger.warning("config.toml 不存在，SESSDATA 仅保留在内存缓存")
-                return
-            with open(config_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            in_bilibili = False
-            updated = False
-            new_lines = []
-            for line in lines:
-                stripped = line.strip()
-                if stripped.startswith("["):
-                    in_bilibili = (stripped == "[bilibili]")
-                if in_bilibili and not updated and re.match(r"\s*sessdata\s*=", line):
-                    line = re.sub(r'(".*?"|\'.*?\')', f'"{new_sessdata}"', line, count=1)
-                    updated = True
-                new_lines.append(line)
-            if updated:
-                with open(config_path, "w", encoding="utf-8") as f:
-                    f.writelines(new_lines)
-                self.ctx.logger.info("SESSDATA 已持久化到 config.toml")
-            else:
-                self.ctx.logger.warning("config.toml 中未找到 [bilibili].sessdata，无法持久化")
-        except Exception as e:
-            self.ctx.logger.warning("持久化 SESSDATA 失败: %s", e)
 
     @staticmethod
     def _cleanup_files(final_path: str, temp_path: str) -> None:

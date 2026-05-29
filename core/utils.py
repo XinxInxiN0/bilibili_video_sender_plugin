@@ -12,6 +12,11 @@ import time
 _logger = logging.getLogger("plugin.bilibili_video_sender.utils")
 
 
+def get_plugin_root_dir() -> str:
+    """返回插件根目录，兼容 core 子包内的路径推导。"""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 def is_running_in_docker() -> bool:
     """检测当前进程是否运行在 Docker 容器内。"""
     if os.path.exists("/.dockerenv"):
@@ -35,8 +40,7 @@ def get_download_temp_dir(linux_temp_dir: str = "") -> str:
     if platform.system().lower() == "linux" and str(linux_temp_dir).strip():
         return os.path.abspath(os.path.expanduser(str(linux_temp_dir).strip()))
 
-    plugin_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(plugin_dir, "tmp")
+    return os.path.join(get_plugin_root_dir(), "tmp")
 
 
 def ensure_shared_file_permissions(file_path: str) -> None:

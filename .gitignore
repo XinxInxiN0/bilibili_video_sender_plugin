@@ -1,6 +1,8 @@
 __pycache__
 config.toml.backup
 config.toml
+auth.json
+auth.json.tmp
 /.claude
 migration-guide.md
 guide.md

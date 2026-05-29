@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
+from .auth import apply_set_cookie, build_cookie_header, has_login_cookie, normalize_credentials
 from .ffmpeg import ffmpeg_manager
 
 _logger = logging.getLogger("plugin.bilibili_video_sender.parser")
@@ -143,7 +144,7 @@ class BilibiliParser:
 
         if not sessdata:
             validation_result["warnings"].append("未配置SESSDATA，将使用游客模式")
-            validation_result["recommendations"].append("建议配置SESSDATA以获得更好的清晰度和功能")
+            validation_result["recommendations"].append("建议配置 auth.json 以获得更好的清晰度和自动续期能力")
         elif len(sessdata) < 10:
             validation_result["errors"].append("SESSDATA长度异常，可能配置错误")
             validation_result["valid"] = False
@@ -156,7 +157,7 @@ class BilibiliParser:
                     expiry_ts = int(parts[1])
                     if 0 < expiry_ts < time.time():
                         expire_dt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expiry_ts))
-                        warn_msg = f"SESSDATA 已过期（过期时间: {expire_dt}），B站将退回游客模式，清晰度受限，请在 config.toml 中更新 SESSDATA"
+                        warn_msg = f"SESSDATA 已过期（过期时间: {expire_dt}），B站将退回游客模式，清晰度受限，请更新 auth.json"
                         validation_result["warnings"].append(warn_msg)
                         _logger.warning(warn_msg)
             except Exception:
@@ -287,6 +288,22 @@ class BilibiliParser:
         return urllib.request.Request(url, headers=default_headers)
 
     @staticmethod
+    def _credentials_from_options(options: Dict[str, Any]) -> Dict[str, Any]:
+        credentials = normalize_credentials(options.get("credentials") if isinstance(options.get("credentials"), dict) else {})
+        if options.get("sessdata") and not credentials.get("SESSDATA"):
+            credentials["SESSDATA"] = str(options.get("sessdata", "")).strip()
+        if options.get("buvid3") and not credentials.get("buvid3"):
+            credentials["buvid3"] = str(options.get("buvid3", "")).strip()
+        return normalize_credentials(credentials)
+
+    @staticmethod
+    def _cookie_header_from_options(options: Dict[str, Any]) -> str:
+        cookie_header = str(options.get("cookie_header", "") or "").strip()
+        if cookie_header:
+            return cookie_header
+        return build_cookie_header(BilibiliParser._credentials_from_options(options))
+
+    @staticmethod
     def _fetch_json(url: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """发送 HTTP 请求并解析 JSON。"""
         req = BilibiliParser._build_request(url, headers=headers)
@@ -333,14 +350,11 @@ class BilibiliParser:
         page_index = BilibiliParser.extract_page_param(url)
 
         opts = options or {}
-        sessdata = str(opts.get("sessdata", "")).strip()
-        buvid3 = str(opts.get("buvid3", "")).strip()
+        credentials = BilibiliParser._credentials_from_options(opts)
+        cookie_header = BilibiliParser._cookie_header_from_options(opts)
         headers: Dict[str, str] = {}
-        if sessdata:
-            cookie_parts = [f"SESSDATA={sessdata}"]
-            if buvid3:
-                cookie_parts.append(f"buvid3={buvid3}")
-            headers["Cookie"] = "; ".join(cookie_parts)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
 
         if bvid:
             query = f"bvid={urllib.parse.quote(bvid)}"
@@ -384,12 +398,14 @@ class BilibiliParser:
         """获取视频播放地址（DASH 或 durl 格式）。"""
         opts = options or {}
 
-        sessdata = str(opts.get("sessdata", "")).strip()
-        buvid3 = str(opts.get("buvid3", "")).strip()
+        credentials = BilibiliParser._credentials_from_options(opts)
+        sessdata = str(credentials.get("SESSDATA", "")).strip()
+        buvid3 = str(credentials.get("buvid3", "")).strip()
+        cookie_header = BilibiliParser._cookie_header_from_options(opts)
         requested_qn = BilibiliParser.safe_int(opts.get("qn", 0))
         strict_qn = bool(opts.get("qn_strict", False)) and requested_qn != 0
 
-        has_cookie = bool(sessdata)
+        has_cookie = has_login_cookie(credentials)
 
         if not has_cookie:
             _logger.warning("未提供 Cookie，将使用游客模式（清晰度限制）")
@@ -450,22 +466,19 @@ class BilibiliParser:
         api = f"{api_base}?{query_str}"
 
         headers: Dict[str, str] = {}
-        if sessdata:
-            cookie_parts = [f"SESSDATA={sessdata}"]
-            if buvid3:
-                cookie_parts.append(f"buvid3={buvid3}")
-            headers["Cookie"] = "; ".join(cookie_parts)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
 
         try:
             req = BilibiliParser._build_request(api, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public API
                 data_bytes = resp.read()
-                # 捕获 B站可能刷新的 SESSDATA（rolling session）
-                refreshed = BilibiliParser._extract_refreshed_sessdata(resp.headers, sessdata)
-                if refreshed:
-                    opts["sessdata"] = refreshed
-                    opts["sessdata_refreshed"] = True
-                    _logger.info("SESSDATA 已由 B站自动刷新")
+                # 捕获 B站可能刷新的 Cookie（rolling session）
+                updated_credentials = apply_set_cookie(credentials, resp.headers)
+                if updated_credentials != credentials:
+                    opts["credentials"] = updated_credentials
+                    opts["auth_refreshed"] = True
+                    _logger.info("B站 Cookie 已由响应头自动刷新")
         except Exception as e:
             _logger.error("HTTP请求失败: %s", e)
             return None, f"网络请求失败: {e}"
@@ -557,7 +570,7 @@ class BilibiliParser:
                 # 通常因为 SESSDATA 过期或权限不足，B站退回游客级别的流
                 _logger.warning(
                     "自动清晰度降级: 期望 %s (qn=%d)，实际获得 %s (qn=%d)，"
-                    "SESSDATA 可能已过期或账号权限不足，请在 config.toml 中更新 SESSDATA",
+                    "B站登录凭据可能已过期或账号权限不足，请更新 auth.json",
                     BilibiliParser.get_qn_name(qn),
                     qn,
                     selected_name,
@@ -597,12 +610,14 @@ class BilibiliParser:
 
         _logger.debug("=== Force fetch DASH format ===")
 
-        sessdata = str(opts.get("sessdata", "")).strip()
-        buvid3 = str(opts.get("buvid3", "")).strip()
+        credentials = BilibiliParser._credentials_from_options(opts)
+        sessdata = str(credentials.get("SESSDATA", "")).strip()
+        buvid3 = str(credentials.get("buvid3", "")).strip()
+        cookie_header = BilibiliParser._cookie_header_from_options(opts)
         requested_qn = BilibiliParser.safe_int(opts.get("qn", 0))
         strict_qn = bool(opts.get("qn_strict", False)) and requested_qn != 0
 
-        has_cookie = bool(sessdata)
+        has_cookie = has_login_cookie(credentials)
 
         if not has_cookie:
             _logger.warning("Force DASH: no Cookie, may affect HD fetching")
@@ -662,22 +677,19 @@ class BilibiliParser:
         api = f"{api_base}?{query_str}"
 
         headers: Dict[str, str] = {}
-        if sessdata:
-            cookie_parts = [f"SESSDATA={sessdata}"]
-            if buvid3:
-                cookie_parts.append(f"buvid3={buvid3}")
-            headers["Cookie"] = "; ".join(cookie_parts)
+        if cookie_header:
+            headers["Cookie"] = cookie_header
 
         try:
             req = BilibiliParser._build_request(api, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public API
                 data_bytes = resp.read()
-                # 捕获 B站可能刷新的 SESSDATA（rolling session）
-                refreshed = BilibiliParser._extract_refreshed_sessdata(resp.headers, sessdata)
-                if refreshed:
-                    opts["sessdata"] = refreshed
-                    opts["sessdata_refreshed"] = True
-                    _logger.info("Force DASH: SESSDATA 已由 B站自动刷新")
+                # 捕获 B站可能刷新的 Cookie（rolling session）
+                updated_credentials = apply_set_cookie(credentials, resp.headers)
+                if updated_credentials != credentials:
+                    opts["credentials"] = updated_credentials
+                    opts["auth_refreshed"] = True
+                    _logger.info("Force DASH: B站 Cookie 已由响应头自动刷新")
         except Exception as e:
             _logger.error("Force DASH HTTP error: %s", e)
             return None, f"Force DASH network error: {e}"
@@ -765,7 +777,7 @@ class BilibiliParser:
                 # 自动模式：effective target 是 qn，但实际只拿到 selected_qn（低于预期）
                 _logger.warning(
                     "Force DASH 自动清晰度降级: 期望 %s (qn=%d)，实际获得 %s (qn=%d)，"
-                    "SESSDATA 可能已过期或账号权限不足，请在 config.toml 中更新 SESSDATA",
+                    "B站登录凭据可能已过期或账号权限不足，请更新 auth.json",
                     BilibiliParser.get_qn_name(qn),
                     qn,
                     selected_name,
