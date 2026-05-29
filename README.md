@@ -92,23 +92,6 @@ ac_time_value = ""
 
 这些值等同于 B站登录凭据，不要发给别人，也不要提交到 Git 仓库。插件会自动把续期后的 Cookie 写回 `config.toml` 的 `[auth]`。
 
-### Console 辅助脚本
-
-`SESSDATA` 是 HttpOnly Cookie，浏览器 Console 读不到，必须在 Application → Cookies 面板手动复制。下面脚本只能辅助输出非 HttpOnly Cookie 和 `ac_time_value`：
-
-```javascript
-const pick = (name) => document.cookie.match(new RegExp(`${name}=([^;]*)`))?.[1] || "";
-console.log(JSON.stringify({
-  bili_jct: pick("bili_jct"),
-  DedeUserID: pick("DedeUserID"),
-  DedeUserID__ckMd5: pick("DedeUserID__ckMd5"),
-  sid: pick("sid"),
-  buvid3: pick("buvid3"),
-  buvid4: pick("buvid4"),
-  ac_time_value: localStorage.getItem("ac_time_value") || ""
-}, null, 2));
-```
-
 
 ### 参考截图
 
