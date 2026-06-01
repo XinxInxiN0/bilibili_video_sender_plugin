@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import urllib.parse
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
     from ..plugin import ApiConfig
 
 _logger = logging.getLogger("plugin.bilibili_video_sender.sender")
+_NAPCAT_VIDEO_LIMIT_BYTES = 100 * 1024 * 1024
 
 
 async def send_text(
@@ -56,10 +58,22 @@ async def send_video(
         _logger.error("视频文件不存在: %s", original_path)
         return False
 
+    file_size = os.path.getsize(original_path)
+    if file_size > _NAPCAT_VIDEO_LIMIT_BYTES:
+        _logger.info(
+            "Video file exceeds NapCat video limit (%.2f MiB > 100 MiB), uploading as file",
+            file_size / (1024 * 1024),
+        )
+        return await _upload_file_via_onebot(original_path, converted_path, message, api_config)
+
     # MaiBot send_service 对 "video" custom type 无原生支持，会降级为 DictComponent，
     # 导致 QQ OneBot 适配器无法识别而静默丢弃消息（ctx.send.custom 不抛异常仍返回 True）。
     # 直接走 OneBot HTTP API，与旧版本行为一致。
-    return await _send_via_onebot(original_path, converted_path, message, api_config)
+    if await _send_via_onebot(converted_path, message, api_config):
+        return True
+
+    _logger.warning("Video message sending failed, falling back to file upload")
+    return await _upload_file_via_onebot(original_path, converted_path, message, api_config)
 
 
 async def _send_text_via_onebot(
@@ -143,73 +157,130 @@ async def _send_via_sdk(ctx: Any, file_uri: str, message: dict[str, Any]) -> boo
 
 
 async def _send_via_onebot(
+    converted_path: str,
+    message: dict[str, Any],
+    api_config: ApiConfig,
+) -> bool:
+    """直接通过 OneBot HTTP API 发送视频。"""
+    host = api_config.host
+    port = api_config.port
+    token = str(api_config.token).strip()
+    file_uri = _as_file_uri(converted_path)
+
+    is_private = _is_private_message(message)
+    if is_private:
+        user_id = _get_user_id(message)
+        if not user_id:
+            _logger.error("Private message but unable to get user ID")
+            return False
+        api_url = f"http://{host}:{port}/send_private_msg"
+        request_data = {"user_id": user_id, "message": [{"type": "video", "data": {"file": file_uri}}]}
+    else:
+        group_id = _get_group_id(message)
+        if not group_id:
+            _logger.error("Group message but unable to get group ID")
+            return False
+        api_url = f"http://{host}:{port}/send_group_msg"
+        request_data = {"group_id": group_id, "message": [{"type": "video", "data": {"file": file_uri}}]}
+
+    _logger.debug("OneBot video API: %s, data: %s", api_url, request_data)
+    return await _send_onebot_request(api_url, request_data, token, 300, "video")
+
+
+async def _upload_file_via_onebot(
     original_path: str,
     converted_path: str,
     message: dict[str, Any],
     api_config: ApiConfig,
 ) -> bool:
-    """直接通过 OneBot HTTP API 发送视频（fallback）。"""
+    """通过 OneBot 文件上传动作发送文件。"""
+    host = api_config.host
+    port = api_config.port
+    token = str(api_config.token).strip()
+    file_uri = _as_file_uri(converted_path)
+    file_name = os.path.basename(original_path) or "bilibili_video.mp4"
+
+    is_private = _is_private_message(message)
+    if is_private:
+        user_id = _get_user_id(message)
+        if not user_id:
+            _logger.error("Private message but unable to get user ID")
+            return False
+        api_url = f"http://{host}:{port}/upload_private_file"
+        request_data = {"user_id": user_id, "file": file_uri, "name": file_name, "upload_file": True}
+    else:
+        group_id = _get_group_id(message)
+        if not group_id:
+            _logger.error("Group message but unable to get group ID")
+            return False
+        api_url = f"http://{host}:{port}/upload_group_file"
+        request_data = {"group_id": group_id, "file": file_uri, "name": file_name, "upload_file": True}
+
+    _logger.debug("OneBot file API: %s, data: %s", api_url, request_data)
+    return await _send_onebot_request(api_url, request_data, token, 300, "file")
+
+
+async def _send_onebot_request(
+    api_url: str,
+    request_data: dict[str, Any],
+    token: str,
+    timeout: int,
+    action_name: str,
+) -> bool:
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     try:
-        host = api_config.host
-        port = api_config.port
-        token = str(api_config.token).strip()
-
-        file_uri = converted_path
-        if not converted_path.startswith(("http://", "https://", "file://")):
-            file_uri = "file:///" + urllib.request.pathname2url(converted_path).lstrip("/")
-
-        # 判断消息类型
-        is_private = _is_private_message(message)
-        if is_private:
-            user_id = _get_user_id(message)
-            if not user_id:
-                _logger.error("Private message but unable to get user ID")
-                return False
-            api_url = f"http://{host}:{port}/send_private_msg"
-            request_data = {"user_id": user_id, "message": [{"type": "video", "data": {"file": file_uri}}]}
-        else:
-            group_id = _get_group_id(message)
-            if not group_id:
-                _logger.error("Group message but unable to get group ID")
-                return False
-            api_url = f"http://{host}:{port}/send_group_msg"
-            request_data = {"group_id": group_id, "message": [{"type": "video", "data": {"file": file_uri}}]}
-
-        _logger.debug("OneBot API: %s, data: %s", api_url, request_data)
-
-        headers = {}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-
         async with aiohttp.ClientSession() as session:
-            async with session.post(api_url, json=request_data, headers=headers, timeout=300) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    _logger.debug("Video sent successfully via OneBot: %s", result)
-                    return True
-
-                if response.status in (401, 403) and token:
-                    _logger.warning("OneBot auth failed (%d), retrying with access_token", response.status)
-                    retry_url = f"{api_url}?access_token={urllib.parse.quote(token)}"
-                    async with session.post(retry_url, json=request_data, headers=headers, timeout=300) as retry_resp:
-                        if retry_resp.status == 200:
-                            result = await retry_resp.json()
-                            _logger.debug("Video sent successfully via OneBot (retry): %s", result)
-                            return True
-                        error_text = await retry_resp.text()
-                        _logger.error("Failed to send video (retry): HTTP %d, %s", retry_resp.status, error_text)
-                        return False
-
-                error_text = await response.text()
-                _logger.error("Failed to send video: HTTP %d, %s", response.status, error_text)
-                return False
-
+            status, body = await _post_onebot(session, api_url, request_data, headers, timeout)
+            if status in (401, 403) and token:
+                _logger.warning("OneBot auth failed (%d), retrying with access_token", status)
+                retry_url = f"{api_url}?access_token={urllib.parse.quote(token)}"
+                status, body = await _post_onebot(session, retry_url, request_data, headers, timeout)
+            return _onebot_result_ok(action_name, status, body)
     except asyncio.TimeoutError:
-        _logger.error("Video sending timeout")
+        _logger.error("OneBot %s sending timeout", action_name)
         return False
     except Exception as e:
-        _logger.error("Video sending error: %s", e)
+        _logger.error("OneBot %s sending error: %s", action_name, e)
         return False
+
+
+async def _post_onebot(
+    session: aiohttp.ClientSession,
+    api_url: str,
+    request_data: dict[str, Any],
+    headers: dict[str, str],
+    timeout: int,
+) -> tuple[int, str]:
+    async with session.post(api_url, json=request_data, headers=headers, timeout=timeout) as response:
+        return response.status, await response.text()
+
+
+def _onebot_result_ok(action_name: str, status: int, body: str) -> bool:
+    if status != 200:
+        _logger.error("Failed to send %s: HTTP %d, %s", action_name, status, body)
+        return False
+
+    try:
+        result = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        _logger.error("Failed to send %s: invalid OneBot response %s", action_name, body)
+        return False
+
+    if result.get("status") == "ok" and result.get("retcode") in (0, "0"):
+        _logger.debug("%s sent successfully via OneBot: %s", action_name.capitalize(), result)
+        return True
+
+    _logger.error("Failed to send %s: %s", action_name, result)
+    return False
+
+
+def _as_file_uri(path: str) -> str:
+    if path.startswith(("http://", "https://", "file://")):
+        return path
+    return "file:///" + urllib.request.pathname2url(path).lstrip("/")
 
 
 def _is_private_message(message: dict[str, Any]) -> bool:

@@ -28,20 +28,60 @@ from .core.utils import ensure_shared_file_permissions, get_download_temp_dir
 # ── 配置模型 ─────────────────────────────────────────────────
 
 
+def _ui(label: str, hint: str, order: int, **extra: Any) -> dict[str, Any]:
+    """构造 WebUI 字段元数据。"""
+
+    metadata: dict[str, Any] = {"label": label, "hint": hint, "order": order}
+    metadata.update(extra)
+    return metadata
+
+
 class BilibiliAuthConfig(PluginConfigBase):
     """B站登录凭据配置。"""
     __ui_label__ = "B站认证"
     __ui_icon__ = "key"
     __ui_order__ = 1
 
-    SESSDATA: str = Field(default="", description="B站 SESSDATA Cookie")
-    bili_jct: str = Field(default="", description="B站 bili_jct Cookie")
-    DedeUserID: str = Field(default="", description="B站 DedeUserID Cookie")
-    DedeUserID__ckMd5: str = Field(default="", description="B站 DedeUserID__ckMd5 Cookie")
-    sid: str = Field(default="", description="B站 sid Cookie")
-    buvid3: str = Field(default="", description="B站 buvid3 Cookie")
-    buvid4: str = Field(default="", description="B站 buvid4 Cookie")
-    ac_time_value: str = Field(default="", description="B站 Local Storage 中的 ac_time_value")
+    SESSDATA: str = Field(
+        default="",
+        description="B站 SESSDATA Cookie",
+        json_schema_extra=_ui("SESSDATA", "B站 SESSDATA Cookie", 0),
+    )
+    bili_jct: str = Field(
+        default="",
+        description="B站 bili_jct Cookie",
+        json_schema_extra=_ui("bili_jct", "B站 bili_jct Cookie", 1),
+    )
+    DedeUserID: str = Field(
+        default="",
+        description="B站 DedeUserID Cookie",
+        json_schema_extra=_ui("DedeUserID", "B站 DedeUserID Cookie", 2),
+    )
+    DedeUserID__ckMd5: str = Field(
+        default="",
+        description="B站 DedeUserID__ckMd5 Cookie",
+        json_schema_extra=_ui("DedeUserID__ckMd5", "B站 DedeUserID__ckMd5 Cookie", 3),
+    )
+    sid: str = Field(
+        default="",
+        description="B站 sid Cookie",
+        json_schema_extra=_ui("sid", "B站 sid Cookie", 4),
+    )
+    buvid3: str = Field(
+        default="",
+        description="B站 buvid3 Cookie",
+        json_schema_extra=_ui("buvid3", "B站 buvid3 Cookie", 5),
+    )
+    buvid4: str = Field(
+        default="",
+        description="B站 buvid4 Cookie",
+        json_schema_extra=_ui("buvid4", "B站 buvid4 Cookie", 6),
+    )
+    ac_time_value: str = Field(
+        default="",
+        description="B站 Local Storage 中的 ac_time_value",
+        json_schema_extra=_ui("ac_time_value", "B站 Local Storage 中的 ac_time_value", 7),
+    )
 
 
 class BilibiliConfig(PluginConfigBase):
@@ -50,16 +90,65 @@ class BilibiliConfig(PluginConfigBase):
     __ui_icon__ = "videocam"
     __ui_order__ = 2
 
-    enable_cookie_refresh: bool = Field(default=True, description="是否启用 B 站 Cookie 主动续期")
-    qn: int = Field(default=0, description="清晰度设置(qn)，0 为自动（登录默认 720P，未登录默认 480P）", ge=0)
-    qn_strict: bool = Field(default=False, description="是否严格按 qn 选择清晰度")
-    group_at_only: bool = Field(default=False, description="群聊中仅当被 @ 时才处理 B 站链接")
-    block_ai_reply: bool = Field(default=True, description="检测到 B 站视频链接后是否阻止后续 AI 回复")
-    enable_video_compression: bool = Field(default=True, description="是否启用视频压缩功能")
-    max_video_size_mb: int = Field(default=100, description="视频文件大小限制（MB），超过此大小将进行压缩", ge=1)
-    compression_quality: int = Field(default=23, description="视频压缩质量 (1-51，数值越小质量越高)", ge=1, le=51)
-    enable_duration_limit: bool = Field(default=True, description="是否启用视频时长限制")
-    max_video_duration: int = Field(default=600, description="视频最大时长限制（秒），超过此时长将拒绝发送", ge=1)
+    enable_cookie_refresh: bool = Field(
+        default=True,
+        description="是否启用 B 站 Cookie 主动续期",
+        json_schema_extra=_ui(
+            "Cookie 主动续期",
+            "是否启用 B 站 Cookie 主动续期",
+            0,
+        ),
+    )
+    qn: int = Field(
+        default=0,
+        description="清晰度设置(qn)，0 为自动（登录默认 720P，未登录默认 480P）",
+        ge=0,
+        json_schema_extra=_ui("视频清晰度", "清晰度设置(qn)，0 为自动（登录默认 720P，未登录默认 480P）", 1),
+    )
+    qn_strict: bool = Field(
+        default=False,
+        description="是否严格按 qn 选择清晰度",
+        json_schema_extra=_ui("严格匹配清晰度", "是否严格按 qn 选择清晰度", 2),
+    )
+    group_at_only: bool = Field(
+        default=False,
+        description="群聊中仅当被 @ 时才处理 B 站链接",
+        json_schema_extra=_ui("群聊仅 @ 时处理", "群聊中仅当被 @ 时才处理 B 站链接", 3),
+    )
+    block_ai_reply: bool = Field(
+        default=True,
+        description="检测到 B 站视频链接后是否阻止后续 AI 回复",
+        json_schema_extra=_ui("拦截 AI 回复", "检测到 B 站视频链接后是否阻止后续 AI 回复", 4),
+    )
+    enable_video_compression: bool = Field(
+        default=True,
+        description="是否启用视频压缩功能",
+        json_schema_extra=_ui("视频压缩", "是否启用视频压缩功能", 5),
+    )
+    max_video_size_mb: int = Field(
+        default=100,
+        description="视频文件大小限制（MB），超过此大小将进行压缩",
+        ge=1,
+        json_schema_extra=_ui("视频大小上限", "视频文件大小限制（MB），超过此大小将进行压缩", 6),
+    )
+    compression_quality: int = Field(
+        default=23,
+        description="视频压缩质量 (1-51，数值越小质量越高)",
+        ge=1,
+        le=51,
+        json_schema_extra=_ui("压缩质量 CRF", "视频压缩质量 (1-51，数值越小质量越高)", 7),
+    )
+    enable_duration_limit: bool = Field(
+        default=True,
+        description="是否启用视频时长限制",
+        json_schema_extra=_ui("视频时长限制", "是否启用视频时长限制", 8),
+    )
+    max_video_duration: int = Field(
+        default=600,
+        description="视频最大时长限制（秒），超过此时长将拒绝发送",
+        ge=1,
+        json_schema_extra=_ui("最大视频时长", "视频最大时长限制（秒），超过此时长将拒绝发送", 9),
+    )
 
 
 class ParserConfig(PluginConfigBase):
@@ -67,7 +156,11 @@ class ParserConfig(PluginConfigBase):
     __ui_label__ = "解析器设置"
     __ui_order__ = 3
 
-    enable_miniapp_card: bool = Field(default=True, description="是否允许解析 B 站小卡片")
+    enable_miniapp_card: bool = Field(
+        default=True,
+        description="是否允许解析 B 站小卡片",
+        json_schema_extra=_ui("解析小程序卡片", "是否允许解析 B 站小卡片", 0),
+    )
 
 
 class FFmpegConfig(PluginConfigBase):
@@ -76,12 +169,29 @@ class FFmpegConfig(PluginConfigBase):
     __ui_icon__ = "build"
     __ui_order__ = 4
 
-    show_warnings: bool = Field(default=True, description="是否显示 FFmpeg 相关警告信息")
-    enable_hardware_acceleration: bool = Field(default=True, description="是否启用硬件加速自动检测")
-    force_encoder: str = Field(default="", description="强制使用特定编码器（留空则自动选择）")
+    show_warnings: bool = Field(
+        default=True,
+        description="是否显示 FFmpeg 相关警告信息",
+        json_schema_extra=_ui("显示 FFmpeg 警告", "是否显示 FFmpeg 相关警告信息", 0),
+    )
+    enable_hardware_acceleration: bool = Field(
+        default=True,
+        description="是否启用硬件加速自动检测",
+        json_schema_extra=_ui("硬件加速检测", "是否启用硬件加速自动检测", 1),
+    )
+    force_encoder: str = Field(
+        default="",
+        description="强制使用特定编码器（留空则自动选择）",
+        json_schema_extra=_ui("强制编码器", "强制使用特定编码器（留空则自动选择）", 2),
+    )
     encoder_priority: list[str] = Field(
         default=["nvidia", "intel", "amd", "apple"],
         description="编码器优先级（当检测到多个硬件编码器时的选择顺序）",
+        json_schema_extra=_ui(
+            "编码器优先级",
+            "编码器优先级（当检测到多个硬件编码器时的选择顺序）",
+            3,
+        ),
     )
 
 
@@ -93,10 +203,20 @@ class EnvironmentConfig(PluginConfigBase):
     runtime_mode: str = Field(
         default="windows",
         description="运行环境模式：windows = 纯 Windows 环境 | wsl = WSL 混合环境 | linux = 纯 Linux 环境",
+        json_schema_extra=_ui(
+            "运行环境模式",
+            "运行环境模式：windows = 纯 Windows 环境 | wsl = WSL 混合环境 | linux = 纯 Linux 环境",
+            0,
+        ),
     )
     linux_temp_dir: str = Field(
         default="",
         description="Linux 自定义视频临时目录（留空则使用插件目录 tmp；建议填写 NapCat 可读取的目录，如 /var/tmp/maibot_bilibili）",
+        json_schema_extra=_ui(
+            "Linux 临时目录",
+            "Linux 自定义视频临时目录（留空则使用插件目录 tmp；建议填写 NapCat 可读取的目录，如 /var/tmp/maibot_bilibili）",
+            1,
+        ),
     )
 
 
@@ -105,9 +225,23 @@ class ApiConfig(PluginConfigBase):
     __ui_label__ = "API设置"
     __ui_order__ = 6
 
-    host: str = Field(default="127.0.0.1", description="OneBot HTTP API 主机名/地址")
-    port: int = Field(default=5700, description="OneBot HTTP API 端口号", ge=1, le=65535)
-    token: str = Field(default="", description="OneBot HTTP API Token")
+    host: str = Field(
+        default="127.0.0.1",
+        description="OneBot HTTP API 主机名/地址",
+        json_schema_extra=_ui("OneBot API 主机", "OneBot HTTP API 主机名/地址", 0),
+    )
+    port: int = Field(
+        default=5700,
+        description="OneBot HTTP API 端口号",
+        ge=1,
+        le=65535,
+        json_schema_extra=_ui("OneBot API 端口", "OneBot HTTP API 端口号", 1),
+    )
+    token: str = Field(
+        default="",
+        description="OneBot HTTP API Token",
+        json_schema_extra=_ui("OneBot API Token", "OneBot HTTP API Token", 2),
+    )
 
 
 class PluginMetaConfig(PluginConfigBase):
@@ -115,19 +249,48 @@ class PluginMetaConfig(PluginConfigBase):
     __ui_label__ = "插件设置"
     __ui_order__ = 0
 
-    config_version: str = Field(default="2.0.6", description="配置版本（勿手动修改）")
-    enabled: bool = Field(default=True, description="是否启用插件")
+    config_version: str = Field(
+        default="2.0.6",
+        description="配置版本（勿手动修改）",
+        json_schema_extra=_ui("配置版本", "配置版本（勿手动修改）", 99),
+    )
+    enabled: bool = Field(
+        default=True,
+        description="是否启用插件",
+        json_schema_extra=_ui("启用插件", "是否启用插件", 0),
+    )
 
 
 class PluginConfig(PluginConfigBase):
     """插件总配置。"""
-    plugin: PluginMetaConfig = Field(default_factory=PluginMetaConfig)
-    auth: BilibiliAuthConfig = Field(default_factory=BilibiliAuthConfig)
-    bilibili: BilibiliConfig = Field(default_factory=BilibiliConfig)
-    parser: ParserConfig = Field(default_factory=ParserConfig)
-    ffmpeg: FFmpegConfig = Field(default_factory=FFmpegConfig)
-    environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
-    api: ApiConfig = Field(default_factory=ApiConfig)
+    plugin: PluginMetaConfig = Field(
+        default_factory=PluginMetaConfig,
+        json_schema_extra=_ui("插件设置", "插件元配置（框架必需，勿删除）。", 0),
+    )
+    auth: BilibiliAuthConfig = Field(
+        default_factory=BilibiliAuthConfig,
+        json_schema_extra=_ui("B站认证", "B站登录凭据配置。", 1),
+    )
+    bilibili: BilibiliConfig = Field(
+        default_factory=BilibiliConfig,
+        json_schema_extra=_ui("B站设置", "B站 API 与视频处理配置。", 2),
+    )
+    parser: ParserConfig = Field(
+        default_factory=ParserConfig,
+        json_schema_extra=_ui("解析器设置", "解析器配置。", 3),
+    )
+    ffmpeg: FFmpegConfig = Field(
+        default_factory=FFmpegConfig,
+        json_schema_extra=_ui("FFmpeg设置", "FFmpeg 相关配置。", 4),
+    )
+    environment: EnvironmentConfig = Field(
+        default_factory=EnvironmentConfig,
+        json_schema_extra=_ui("环境设置", "运行环境配置。", 5),
+    )
+    api: ApiConfig = Field(
+        default_factory=ApiConfig,
+        json_schema_extra=_ui("API设置", "OneBot API 配置（视频发送 fallback 用）。", 6),
+    )
 
 
 # ── 插件主类 ─────────────────────────────────────────────────
