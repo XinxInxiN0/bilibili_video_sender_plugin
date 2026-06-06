@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import gzip
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
+import zlib
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from typing import Any, Dict, Optional
@@ -262,6 +264,44 @@ class BilibiliAuthRefresher:
             return AuthRefreshResult(status="refresh_failed", credentials={}, message=str(e))
 
     @classmethod
+    def force_refresh(cls, credentials: Dict[str, Any], timestamp_ms: Optional[int] = None) -> AuthRefreshResult:
+        """Force a real refresh for controlled diagnostics.
+
+        Unlike refresh_if_needed(), this method may refresh even when /cookie/info
+        currently reports refresh=false. It still requires a valid logged-in
+        cookie because Bilibili's refresh endpoint is cookie-authenticated.
+        """
+        creds = normalize_credentials(credentials)
+        if not has_login_cookie(creds):
+            return AuthRefreshResult(status="guest", credentials={}, message="未配置 B站登录凭据")
+
+        missing = [name for name in ("bili_jct", "ac_time_value") if not creds.get(name)]
+        if missing:
+            return AuthRefreshResult(
+                status="missing_material",
+                credentials={},
+                message=f"缺少刷新凭据: {', '.join(missing)}",
+            )
+        if not cls.cryptography_available():
+            return AuthRefreshResult(
+                status="dependency_missing",
+                credentials={},
+                message="缺少 cryptography，无法主动刷新 B站 Cookie",
+            )
+
+        effective_timestamp = timestamp_ms
+        if effective_timestamp is None:
+            check = cls.check_refresh(creds)
+            if check.status not in {"ok", "refresh_required"}:
+                return AuthRefreshResult(status=check.status, credentials={}, message=check.message)
+            effective_timestamp = check.timestamp_ms or int(time.time() * 1000)
+
+        try:
+            return cls._refresh(creds, int(effective_timestamp))
+        except Exception as e:
+            return AuthRefreshResult(status="refresh_failed", credentials={}, message=str(e))
+
+    @classmethod
     def _refresh(cls, credentials: Dict[str, Any], timestamp_ms: int) -> AuthRefreshResult:
         old_token = str(credentials.get("ac_time_value", "")).strip()
         correspond_path = cls._build_correspond_path(timestamp_ms)
@@ -338,11 +378,24 @@ class BilibiliAuthRefresher:
             },
         )
         with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public API
-            html_text = resp.read().decode("utf-8", errors="ignore")
+            html_text = _read_response_text(resp)
         match = re.search(r'<div\s+id=["\']1-name["\']>([^<]+)</div>', html_text, re.IGNORECASE)
         if not match:
             raise ValueError("未能获取 refresh_csrf")
         return html.unescape(match.group(1).strip())
+
+
+def _read_response_text(resp: Any) -> str:
+    data = resp.read()
+    encoding = str(resp.headers.get("Content-Encoding") or "").lower()
+    try:
+        if encoding == "gzip" or data.startswith(b"\x1f\x8b"):
+            data = gzip.decompress(data)
+        elif encoding == "deflate":
+            data = zlib.decompress(data)
+    except Exception:
+        _logger.debug("响应解压失败，将按原始字节解码", exc_info=True)
+    return data.decode("utf-8", errors="ignore")
 
 
 def _fetch_json(url: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -355,8 +408,8 @@ def _fetch_json(url: str, headers: Optional[Dict[str, str]] = None) -> Dict[str,
         },
     )
     with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public API
-        data = resp.read()
-    return json.loads(data.decode("utf-8", errors="ignore"))
+        text = _read_response_text(resp)
+    return json.loads(text)
 
 
 def _post_form(
@@ -378,7 +431,7 @@ def _post_form(
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public API
-        payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        payload = json.loads(_read_response_text(resp))
         return payload, resp.headers
 
 
