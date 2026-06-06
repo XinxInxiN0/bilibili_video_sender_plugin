@@ -51,6 +51,9 @@ class BilibiliConfig(PluginConfigBase):
     __ui_order__ = 2
 
     enable_cookie_refresh: bool = Field(default=True, description="是否启用 B 站 Cookie 主动续期")
+    cookie_refresh_interval_minutes: int = Field(default=720, description="B站 Cookie 后台检查间隔（分钟）", ge=1)
+    cookie_refresh_retry_minutes: int = Field(default=60, description="B站 Cookie 后台检查失败后的重试间隔（分钟）", ge=1)
+    cookie_refresh_startup_check: bool = Field(default=True, description="插件启动后是否立即检查 B站 Cookie 状态")
     qn: int = Field(default=0, description="清晰度设置(qn)，0 为自动（登录默认 720P，未登录默认 480P）", ge=0)
     qn_strict: bool = Field(default=False, description="是否严格按 qn 选择清晰度")
     group_at_only: bool = Field(default=False, description="群聊中仅当被 @ 时才处理 B 站链接")
@@ -115,7 +118,7 @@ class PluginMetaConfig(PluginConfigBase):
     __ui_label__ = "插件设置"
     __ui_order__ = 0
 
-    config_version: str = Field(default="2.0.6", description="配置版本（勿手动修改）")
+    config_version: str = Field(default="2.0.7", description="配置版本（勿手动修改）")
     enabled: bool = Field(default=True, description="是否启用插件")
 
 
@@ -145,6 +148,7 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         """插件加载：预热 FFmpeg 缓存。"""
         self.ctx.logger.info("Bilibili video sender plugin loading...")
         self._auth_lock = asyncio.Lock()
+        self._auth_refresh_task: asyncio.Task[None] | None = None
         self._config_path = os.path.join(os.path.dirname(__file__), "config.toml")
         self._auth_credentials = self._credentials_from_config()
         if has_login_cookie(self._auth_credentials):
@@ -166,11 +170,15 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         except Exception:
             self._bot_qq = ""
 
+        if self.config.bilibili.enable_cookie_refresh:
+            self._start_auth_refresh_task()
+
         self.ctx.logger.info("Bilibili video sender plugin loaded")
 
     async def on_unload(self) -> None:
         """插件卸载：清理临时文件。"""
         self.ctx.logger.info("Bilibili video sender plugin unloading...")
+        await self._stop_auth_refresh_task()
         tmp_dir = get_download_temp_dir(self.config.environment.linux_temp_dir)
         try:
             for f in os.listdir(tmp_dir):
@@ -189,6 +197,10 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         if scope == CONFIG_RELOAD_SCOPE_SELF:
             self.ctx.logger.info("Plugin config updated to version %s", version)
             self._auth_credentials = self._credentials_from_config()
+            if self.config.bilibili.enable_cookie_refresh:
+                self._start_auth_refresh_task()
+            else:
+                await self._stop_auth_refresh_task()
 
     def _credentials_from_config(self) -> dict[str, Any]:
         """从 config.toml 的 [auth] 段构造 B站登录凭据。"""
@@ -217,6 +229,113 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         self._update_auth_config_instance(normalized)
         config_path = getattr(self, "_config_path", os.path.join(os.path.dirname(__file__), "config.toml"))
         await loop.run_in_executor(None, save_auth_config, config_path, normalized)
+
+    def _start_auth_refresh_task(self) -> None:
+        task = getattr(self, "_auth_refresh_task", None)
+        if task and not task.done():
+            return
+        self._auth_refresh_task = asyncio.create_task(
+            self._cookie_refresh_loop(),
+            name="bilibili_cookie_refresh",
+        )
+        self.ctx.logger.info("B站 Cookie 后台维护任务已启动")
+
+    async def _stop_auth_refresh_task(self) -> None:
+        task = getattr(self, "_auth_refresh_task", None)
+        if not task:
+            return
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._auth_refresh_task = None
+
+    def _cookie_refresh_interval_seconds(self) -> int:
+        minutes = max(1, int(getattr(self.config.bilibili, "cookie_refresh_interval_minutes", 720) or 720))
+        return minutes * 60
+
+    def _cookie_refresh_retry_seconds(self) -> int:
+        minutes = max(1, int(getattr(self.config.bilibili, "cookie_refresh_retry_minutes", 60) or 60))
+        return minutes * 60
+
+    async def _cookie_refresh_loop(self) -> None:
+        """后台维护 B站 Cookie，避免只有用户发视频时才触发续期。"""
+        try:
+            if not self.config.bilibili.cookie_refresh_startup_check:
+                await asyncio.sleep(self._cookie_refresh_interval_seconds())
+
+            while True:
+                try:
+                    next_delay = await self._run_cookie_refresh_check()
+                except Exception as e:
+                    self.ctx.logger.exception("B站 Cookie 后台检查异常，将稍后重试: %s", e)
+                    next_delay = self._cookie_refresh_retry_seconds()
+                await asyncio.sleep(next_delay)
+        except asyncio.CancelledError:
+            self.ctx.logger.info("B站 Cookie 后台维护任务已停止")
+            raise
+
+    async def _run_cookie_refresh_check(self) -> int:
+        interval = self._cookie_refresh_interval_seconds()
+        retry = self._cookie_refresh_retry_seconds()
+
+        if not self.config.bilibili.enable_cookie_refresh:
+            return interval
+
+        credentials = normalize_credentials(getattr(self, "_auth_credentials", {}))
+        if not has_login_cookie(credentials):
+            self.ctx.logger.warning("B站 Cookie 后台检查跳过：config.toml [auth] 未配置 SESSDATA")
+            return interval
+
+        loop = asyncio.get_running_loop()
+        check = await loop.run_in_executor(None, BilibiliAuthRefresher.check_refresh, credentials)
+        if check.status == "ok":
+            self.ctx.logger.debug("B站 Cookie 后台检查通过，无需续期")
+            return interval
+        if check.status == "guest":
+            self.ctx.logger.warning("B站 Cookie 后台检查跳过：未配置登录凭据")
+            return interval
+        if check.status == "invalid":
+            self.ctx.logger.warning("B站 Cookie 已失效，无法自动续期: %s", check.message)
+            return retry
+        if check.status != "refresh_required":
+            self.ctx.logger.warning("B站 Cookie 后台检查失败，保留现有凭据并稍后重试: %s", check.message)
+            return retry
+
+        missing = [name for name in ("bili_jct", "ac_time_value") if not credentials.get(name)]
+        if missing:
+            self.ctx.logger.warning("B站 Cookie 需要续期，但缺少刷新凭据: %s", ", ".join(missing))
+            return retry
+
+        if not BilibiliAuthRefresher.cryptography_available():
+            self.ctx.logger.warning("B站 Cookie 需要续期，但当前环境缺少 cryptography")
+            return retry
+
+        snapshot_token = str(credentials.get("ac_time_value", ""))
+        snapshot_updated = str(credentials.get("updated_at", ""))
+        async with self._auth_lock:
+            current = normalize_credentials(getattr(self, "_auth_credentials", {}))
+            if (
+                str(current.get("ac_time_value", "")) != snapshot_token
+                or str(current.get("updated_at", "")) != snapshot_updated
+            ):
+                self.ctx.logger.info("B站 Cookie 后台续期跳过：凭据已由其他任务更新")
+                return interval
+
+            result = await loop.run_in_executor(None, BilibiliAuthRefresher.refresh_if_needed, current)
+            if result.ok:
+                if result.credentials:
+                    await self._persist_auth(result.credentials)
+                if result.refreshed:
+                    self.ctx.logger.info("B站 Cookie 已由后台任务主动续期并写入 config.toml [auth]")
+                else:
+                    self.ctx.logger.debug("B站 Cookie 后台复查后无需续期")
+                return interval
+
+            self.ctx.logger.warning("B站 Cookie 后台续期失败: status=%s, message=%s", result.status, result.message)
+            return retry
 
     async def _ensure_auth_ready(self) -> tuple[dict[str, Any], str | None]:
         """按需刷新 B站登录凭据，返回本轮应使用的凭据和可选用户提示。"""
@@ -270,7 +389,11 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             self.ctx.logger.warning("B站 Cookie 续期失败: status=%s, message=%s", result.status, result.message)
             if result.status == "dependency_missing":
                 return current, "B站 Cookie 需要续期，但当前环境缺少 cryptography；请管理员执行 pip install cryptography。"
-            return {}, "B站登录凭据已过期或触发风控，请管理员重新获取并更新 config.toml 的 [auth]。"
+            if result.status == "missing_material":
+                return current, f"B站 Cookie 需要续期，但缺少刷新凭据：{result.message}。"
+            if result.status in {"refresh_failed", "confirm_failed"}:
+                return current, f"B站 Cookie 续期失败（{result.message}），请管理员检查或重新获取登录凭据。"
+            return current, f"B站 Cookie 续期失败：{result.message or result.status}。"
 
     # ── Hook 拦截 ─────────────────────────────────────────
     # chat.receive.after_process 在 message.process() 之后、maisaka 路由之前触发。
