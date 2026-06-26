@@ -76,6 +76,29 @@ async def send_video(
     return await _upload_file_via_onebot(original_path, converted_path, message, api_config)
 
 
+async def send_emoji_reaction(
+    message_id: str | int,
+    emoji_id: int,
+    api_config: "ApiConfig",
+) -> bool:
+    """对原始消息添加 QQ 表情回应（set_msg_emoji_like）。"""
+    if not message_id:
+        return False
+    try:
+        mid = int(message_id)
+    except (ValueError, TypeError):
+        _logger.warning("Invalid message_id for emoji reaction: %r", message_id)
+        return False
+
+    host = api_config.host
+    port = api_config.port
+    token = str(api_config.token).strip()
+    api_url = f"http://{host}:{port}/set_msg_emoji_like"
+    request_data = {"message_id": mid, "emoji_id": emoji_id, "set": True}
+    _logger.debug("Emoji reaction: url=%s, data=%s", api_url, request_data)
+    return await _send_onebot_request(api_url, request_data, token, 10, "emoji_reaction")
+
+
 async def _send_text_via_onebot(
     content: str,
     message: dict[str, Any],
