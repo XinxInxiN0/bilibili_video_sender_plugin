@@ -93,25 +93,6 @@ ac_time_value = ""
 这些值等同于 B站登录凭据，不要发给别人，也不要提交到 Git 仓库。插件会自动把续期后的 Cookie 写回 `config.toml` 的 `[auth]`。
 
 
-### 参考截图
-
-- 开发者工具打开界面  
-  ![开发者工具界面](https://github.com/user-attachments/assets/d8b040de-a038-4772-b588-26df92d5ce73)
-
-- Application 栏  
-  ![Application 栏](https://github.com/user-attachments/assets/0b8a5954-d6cd-47b6-95b9-126115203907)
-
-- Cookie 位置  
-  ![Cookie 位置](https://github.com/user-attachments/assets/4dc9c217-f78d-4d68-bb00-71ace2d3381f)
-
-- bilibili Cookie  
-  ![bilibili Cookie](https://github.com/user-attachments/assets/d82e3b15-64cd-490b-8eea-c6258ca0f6e2)
-
-- sessdata 和 buvid3 示例  
-  ![sessdata 和 buvid3](https://github.com/user-attachments/assets/607aa291-c927-4d00-8975-5e85fa0d1214)
-
----
-
 ## 解析成功通知方式（v2.0.8+）
 
 在 `[bilibili]` 段可以选择解析成功后的通知方式：
