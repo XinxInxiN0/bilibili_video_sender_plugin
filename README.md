@@ -111,6 +111,30 @@ ac_time_value = ""
   ![sessdata 和 buvid3](https://github.com/user-attachments/assets/607aa291-c927-4d00-8975-5e85fa0d1214)
 
 ---
+
+## 解析成功通知方式（v2.0.8+）
+
+在 `[bilibili]` 段可以选择解析成功后的通知方式：
+
+```toml
+[bilibili]
+success_notification_mode = "text"   # text=发送文字通知（默认）| emoji=对原消息贴表情回应
+reaction_emoji_id = 124               # 表情回应时使用的 QQ 表情 ID（仅 emoji 模式生效）
+```
+
+- `text`（默认）：解析成功后发送一条「解析成功」文字消息，行为与旧版本一致
+- `emoji`：解析成功后对用户发送的原始链接消息添加表情回应，不再发送文字通知
+
+> **注意**：表情回应仅在**群聊**中生效，私聊始终使用文字通知。表情回应依赖 NapCat 扩展 API `set_msg_emoji_like`，标准 OneBot 11 不支持此功能。
+
+常用 QQ 表情 ID：
+
+| ID | 表情 |
+|----|------|
+| 124 | OK |
+| 144 | 烟花 |
+
+---
 ### napcat配置和config.toml
 <img width="645" height="749" alt="image" src="https://github.com/user-attachments/assets/223c491f-8433-4c47-923a-c4c830c9e572" />
 <img width="1186" height="807" alt="image" src="https://github.com/user-attachments/assets/10c79e45-048a-46c8-8d1d-ca7a4044070c" />
