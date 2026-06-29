@@ -259,7 +259,7 @@ class PluginMetaConfig(PluginConfigBase):
     __ui_label__ = "插件设置"
     __ui_order__ = 0
 
-    config_version: str = Field(default="2.0.8", description="配置版本（勿手动修改）")
+    config_version: str = Field(default="2.0.9", description="配置版本（勿手动修改）")
     enabled: bool = Field(default=True, description="是否启用插件")
 
 
@@ -662,8 +662,25 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             return None
 
         # URL 检测
+        # 引用消息时，processed_plain_text 会包含 "[回复了某某的消息: 被引用内容]"，
+        # 直接搜索会误触发被引用消息里的链接。
+        # raw_message 中 type=="reply" 的段携带被引用内容，type=="text" 的段才是新消息正文。
+        # 检测到 reply 段后，只拼接 text 段作为搜索源。
+        has_reply = any(
+            isinstance(seg, dict) and seg.get("type") == "reply"
+            for seg in message_segments
+        )
+        if has_reply:
+            effective_text = " ".join(
+                str(seg.get("data", ""))
+                for seg in message_segments
+                if isinstance(seg, dict) and seg.get("type") == "text"
+            )
+        else:
+            effective_text = processed_plain_text
+
         url = ""
-        parse_source = processed_plain_text
+        parse_source = effective_text
 
         if self.config.parser.enable_miniapp_card:
             miniapp_url = self._extract_miniapp_bilibili_url(message)
@@ -672,8 +689,8 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
                 url = miniapp_url
 
         if not url:
-            url = BilibiliParser.find_first_bilibili_url(processed_plain_text) or ""
-            parse_source = processed_plain_text
+            url = BilibiliParser.find_first_bilibili_url(effective_text) or ""
+            parse_source = effective_text
 
         if not url:
             return None
