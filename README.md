@@ -116,6 +116,57 @@ reaction_emoji_id = 124               # 表情回应时使用的 QQ 表情 ID（
 | 144 | 烟花 |
 
 ---
+
+## 短链解析与 DoH 兜底（v2.0.10+）
+
+插件支持 `b23.tv` / `bili2233.cn` 短链，也兼容不带 `https://` 的裸链接。
+
+短链需要先请求一次才能展开成真正的视频地址。部分网络环境下 `b23.tv` 的系统 DNS 会被污染到无法连通的 IP，导致短链展不开、消息看起来像被"忽略"。此时插件会自动改用 DoH 查询真实 IP 并直连（SNI 与证书校验仍按真实域名走，不降低安全性）。
+
+```toml
+[parser]
+doh_enabled = true                                                    # 系统 DNS 解析失败时启用 DoH 兜底（默认开启）
+doh_servers = ["https://223.5.5.5/resolve", "https://1.1.1.1/dns-query"]  # 按顺序尝试
+```
+
+若短链最终仍解析失败，插件会记录 WARNING 日志并回复一条提示，不再静默丢弃。
+
+---
+
+## 访问控制：群 / 用户黑白名单（v2.0.10+）
+
+在 `[access]` 段可以按**群号**和**用户 QQ 号**两个维度限制哪些消息会触发 B 站解析。
+
+```toml
+[access]
+group_mode = "off"          # off=不限制 | whitelist=仅名单内群 | blacklist=名单内群不解析
+group_whitelist = ["123456789"]
+group_blacklist = []
+user_mode = "off"           # off=不限制 | whitelist=仅名单内用户 | blacklist=名单内用户不解析
+user_whitelist = []
+user_blacklist = ["10001"]
+```
+
+规则说明：
+
+- **两个维度是「与」关系**：群维度和用户维度都通过，才会解析。
+- **同一维度同一时刻只有一份名单生效**，由该维度的 `mode` 决定；`mode = "off"` 时两份名单都被忽略。
+- **`whitelist` 模式下名单为空 = 全部拒绝**。想放行所有人请把 `mode` 设回 `"off"`，不要留一个空白名单。
+- **私聊不受群名单影响**：私聊消息没有群号，群维度自动跳过；用户名单在群聊和私聊中都生效。
+- **被名单拦下的消息会正常交给麦麦回复**，插件只是不解析链接，不会静音这条消息（与 `block_ai_reply` 无关）。
+- 名单里的号码请写成**字符串**（带引号），写成数字也能兼容，但字符串更稳妥。
+
+配置示例——只在两个群里启用，并屏蔽一个刷屏的人：
+
+```toml
+[access]
+group_mode = "whitelist"
+group_whitelist = ["123456789", "987654321"]
+user_mode = "blacklist"
+user_blacklist = ["10001"]
+```
+
+---
 ### napcat配置和config.toml
 <img width="645" height="749" alt="image" src="https://github.com/user-attachments/assets/223c491f-8433-4c47-923a-c4c830c9e572" />
 <img width="1186" height="807" alt="image" src="https://github.com/user-attachments/assets/10c79e45-048a-46c8-8d1d-ca7a4044070c" />

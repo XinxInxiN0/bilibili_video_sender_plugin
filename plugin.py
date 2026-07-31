@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
-from typing import Any
+from typing import Any, Literal
 
 from maibot_sdk import (
     CONFIG_RELOAD_SCOPE_SELF,
@@ -27,8 +28,14 @@ from .core.auth import (
 )
 from .core.downloader import download_video
 from .core.ffmpeg import VideoCompressor, ffmpeg_manager
-from .core.parser import BilibiliParser, BilibiliVideoInfo
-from .core.sender import send_emoji_reaction, send_text, send_video
+from .core.parser import DEFAULT_DOH_SERVERS, BilibiliParser, BilibiliVideoInfo
+from .core.sender import (
+    get_group_id,
+    get_user_id,
+    send_emoji_reaction,
+    send_text,
+    send_video,
+)
 from .core.utils import ensure_shared_file_permissions, get_download_temp_dir
 
 # ── 配置模型 ─────────────────────────────────────────────────
@@ -156,16 +163,93 @@ class BilibiliConfig(PluginConfigBase):
     )
 
 
+class AccessControlConfig(PluginConfigBase):
+    """群/用户黑白名单配置。
+
+    群维度与用户维度各自独立判定，两者都通过才会解析（AND 关系）。
+    被拦截的消息不会阻止 AI 回复，插件对该消息完全隐形。
+    """
+
+    __ui_label__ = "访问控制"
+    __ui_icon__ = "shield"
+    __ui_order__ = 3
+
+    group_mode: Literal["off", "whitelist", "blacklist"] = Field(
+        default="off",
+        description="群名单模式：off=不限制 | whitelist=仅名单内群 | blacklist=名单内群不解析",
+        json_schema_extra=_ui(
+            "群名单模式",
+            "off=不限制 | whitelist=仅名单内群 | blacklist=名单内群不解析。私聊不受群名单影响",
+            0,
+        ),
+    )
+    group_whitelist: list[str] = Field(
+        default_factory=list,
+        description="群白名单（群号），group_mode=whitelist 时生效；留空表示所有群都不解析",
+        json_schema_extra=_ui(
+            "群白名单",
+            "群号列表，group_mode=whitelist 时生效。注意：留空表示所有群都不解析",
+            1,
+        ),
+    )
+    group_blacklist: list[str] = Field(
+        default_factory=list,
+        description="群黑名单（群号），group_mode=blacklist 时生效",
+        json_schema_extra=_ui(
+            "群黑名单", "群号列表，group_mode=blacklist 时生效", 2
+        ),
+    )
+    user_mode: Literal["off", "whitelist", "blacklist"] = Field(
+        default="off",
+        description="用户名单模式：off=不限制 | whitelist=仅名单内用户 | blacklist=名单内用户不解析",
+        json_schema_extra=_ui(
+            "用户名单模式",
+            "off=不限制 | whitelist=仅名单内用户 | blacklist=名单内用户不解析。群聊私聊均生效",
+            3,
+        ),
+    )
+    user_whitelist: list[str] = Field(
+        default_factory=list,
+        description="用户白名单（QQ 号），user_mode=whitelist 时生效；留空表示所有人都不解析",
+        json_schema_extra=_ui(
+            "用户白名单",
+            "QQ 号列表，user_mode=whitelist 时生效。注意：留空表示所有人都不解析",
+            4,
+        ),
+    )
+    user_blacklist: list[str] = Field(
+        default_factory=list,
+        description="用户黑名单（QQ 号），user_mode=blacklist 时生效",
+        json_schema_extra=_ui(
+            "用户黑名单", "QQ 号列表，user_mode=blacklist 时生效", 5
+        ),
+    )
+
+
 class ParserConfig(PluginConfigBase):
     """解析器配置。"""
 
     __ui_label__ = "解析器设置"
-    __ui_order__ = 3
+    __ui_order__ = 4
 
     enable_miniapp_card: bool = Field(
         default=True,
         description="是否允许解析 B 站小卡片",
         json_schema_extra=_ui("解析小程序卡片", "是否允许解析 B 站小卡片", 0),
+    )
+    doh_enabled: bool = Field(
+        default=True,
+        description="系统 DNS 解析短链域名失败时，改用 DoH 查询真实 IP 后直连",
+        json_schema_extra=_ui(
+            "DoH 兜底解析",
+            "系统 DNS 解析 b23.tv 失败时，改用 DoH 查询真实 IP 后直连",
+            1,
+        ),
+    )
+    doh_servers: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_DOH_SERVERS),
+        description="DoH 服务器地址列表，按顺序尝试",
+        json_schema_extra=_ui("DoH 服务器", "DoH 服务器地址列表，按顺序尝试", 2),
     )
 
 
@@ -174,7 +258,7 @@ class FFmpegConfig(PluginConfigBase):
 
     __ui_label__ = "FFmpeg设置"
     __ui_icon__ = "build"
-    __ui_order__ = 4
+    __ui_order__ = 5
 
     show_warnings: bool = Field(
         default=True,
@@ -206,7 +290,7 @@ class EnvironmentConfig(PluginConfigBase):
     """运行环境配置。"""
 
     __ui_label__ = "环境设置"
-    __ui_order__ = 5
+    __ui_order__ = 6
 
     runtime_mode: str = Field(
         default="windows",
@@ -232,7 +316,7 @@ class ApiConfig(PluginConfigBase):
     """OneBot API 配置（视频发送 fallback 用）。"""
 
     __ui_label__ = "API设置"
-    __ui_order__ = 6
+    __ui_order__ = 7
 
     host: str = Field(
         default="127.0.0.1",
@@ -259,7 +343,7 @@ class PluginMetaConfig(PluginConfigBase):
     __ui_label__ = "插件设置"
     __ui_order__ = 0
 
-    config_version: str = Field(default="2.0.9", description="配置版本（勿手动修改）")
+    config_version: str = Field(default="2.0.10", description="配置版本（勿手动修改）")
     enabled: bool = Field(default=True, description="是否启用插件")
 
 
@@ -278,22 +362,26 @@ class PluginConfig(PluginConfigBase):
         default_factory=BilibiliConfig,
         json_schema_extra=_ui("B站设置", "B站 API 与视频处理配置。", 2),
     )
+    access: AccessControlConfig = Field(
+        default_factory=AccessControlConfig,
+        json_schema_extra=_ui("访问控制", "群/用户黑白名单配置。", 3),
+    )
     parser: ParserConfig = Field(
         default_factory=ParserConfig,
-        json_schema_extra=_ui("解析器设置", "解析器配置。", 3),
+        json_schema_extra=_ui("解析器设置", "解析器配置。", 4),
     )
     ffmpeg: FFmpegConfig = Field(
         default_factory=FFmpegConfig,
-        json_schema_extra=_ui("FFmpeg设置", "FFmpeg 相关配置。", 4),
+        json_schema_extra=_ui("FFmpeg设置", "FFmpeg 相关配置。", 5),
     )
     environment: EnvironmentConfig = Field(
         default_factory=EnvironmentConfig,
-        json_schema_extra=_ui("环境设置", "运行环境配置。", 5),
+        json_schema_extra=_ui("环境设置", "运行环境配置。", 6),
     )
     api: ApiConfig = Field(
         default_factory=ApiConfig,
         json_schema_extra=_ui(
-            "API设置", "OneBot API 配置（视频发送 fallback 用）。", 6
+            "API设置", "OneBot API 配置（视频发送 fallback 用）。", 7
         ),
     )
 
@@ -661,20 +749,25 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             self.ctx.logger.warning("无法获取 session_id, 跳过处理")
             return None
 
+        # 黑白名单检查（放在 URL 扫描之前，被拦截时直接放行给 AI，不 abort）
+        if not self._is_access_allowed(message):
+            return None
+
         # URL 检测
         # 引用消息时，processed_plain_text 会包含 "[回复了某某的消息: 被引用内容]"，
         # 直接搜索会误触发被引用消息里的链接。
-        # raw_message 中 type=="reply" 的段携带被引用内容，type=="text" 的段才是新消息正文。
-        # 检测到 reply 段后，只拼接 text 段作为搜索源。
+        # raw_message 中 type=="reply"/"forward" 的段携带被引用内容，其余段才是新消息正文。
+        # 检测到引用段后，排除这些段、拼接剩余全部段作为搜索源
+        # （不能只保留 text 段：卡片分享是 dict 段，白名单会把链接一起丢掉）。
         has_reply = any(
-            isinstance(seg, dict) and seg.get("type") == "reply"
+            isinstance(seg, dict) and seg.get("type") in ("reply", "forward")
             for seg in message_segments
         )
         if has_reply:
             effective_text = " ".join(
-                str(seg.get("data", ""))
+                self._stringify_segment_data(seg.get("data"))
                 for seg in message_segments
-                if isinstance(seg, dict) and seg.get("type") == "text"
+                if isinstance(seg, dict) and seg.get("type") not in ("reply", "forward")
             )
         else:
             effective_text = processed_plain_text
@@ -718,6 +811,20 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
         if config.block_ai_reply:
             return {"action": "abort"}
         return None
+
+    @staticmethod
+    def _stringify_segment_data(data: Any) -> str:
+        """把消息段的 data 转成可供链接扫描的文本（卡片等结构化段序列化后再扫）。"""
+        if data is None:
+            return ""
+        if isinstance(data, str):
+            return data
+        if isinstance(data, (dict, list)):
+            try:
+                return json.dumps(data, ensure_ascii=False)
+            except (TypeError, ValueError):
+                return str(data)
+        return str(data)
 
     def _extract_miniapp_bilibili_url(self, message: dict[str, Any]) -> str:
         """从平台适配器透传的小程序卡片 metadata 中提取 B 站链接。"""
@@ -809,6 +916,20 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             ) = await loop.run_in_executor(
                 None, self._resolve_video_sync, url, fallback_qn, credentials
             )
+
+            if status == "short_link_failed":
+                # 网络/DNS 问题导致短链展不开，属于可恢复故障，要让用户和日志都能看见
+                self.ctx.logger.warning(
+                    "短链解析失败，无法继续处理: url=%s, err=%s", url, error_msg
+                )
+                await send_text(
+                    self.ctx,
+                    "短链解析失败了，网络可能不通，麻烦发完整的视频链接~",
+                    session_id,
+                    message,
+                    self.config.api,
+                )
+                return
 
             if status == "unsupported_type":
                 self.ctx.logger.info("Ignoring unsupported Bilibili link type")
@@ -996,19 +1117,33 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
 
         target_url = url
 
-        # 短链接解析（带重试）
-        if "b23.tv" in target_url:
+        # 短链接解析（带重试），失败不再沿用原始短链，避免被误判成"类型不支持"而静默丢弃
+        if BilibiliParser.is_short_link(target_url):
+            parser_config = self.config.parser
+            last_error: Exception | None = None
             for attempt in range(3):
                 try:
-                    target_url = BilibiliParser._follow_redirect(target_url)
+                    target_url = BilibiliParser._follow_redirect(
+                        target_url,
+                        doh_enabled=parser_config.doh_enabled,
+                        doh_servers=list(parser_config.doh_servers or []),
+                    )
+                    last_error = None
                     break
-                except Exception:
+                except Exception as exc:
+                    last_error = exc
                     if attempt < 2:
-                        time_sleep = __import__("time").sleep
-                        time_sleep(attempt + 1)
-                    else:
-                        # 使用原始 URL 继续
-                        pass
+                        __import__("time").sleep(attempt + 1)
+
+            if last_error is not None:
+                return (
+                    None,
+                    None,
+                    None,
+                    "short_link_failed",
+                    f"短链解析失败: {last_error}",
+                    None,
+                )
 
         target_url = BilibiliParser._sanitize_url(target_url)
 
@@ -1110,6 +1245,50 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             pass
 
     # ── 消息工具方法 ──────────────────────────────────────
+
+    @staticmethod
+    def _match_access_mode(
+        mode: str, value: str | None, whitelist: list[str], blacklist: list[str]
+    ) -> bool:
+        """按 mode 判定单个维度是否放行。
+
+        value 为 None（如私聊消息取不到 group_id）时该维度不参与判定，直接放行。
+        whitelist 模式下名单为空表示全部拒绝。
+        """
+        if mode == "off":
+            return True
+        if value is None:
+            return True
+        if mode == "whitelist":
+            return value in {str(item).strip() for item in whitelist}
+        if mode == "blacklist":
+            return value not in {str(item).strip() for item in blacklist}
+        # 非法 mode（配置绕过校验时）按不限制处理，避免整个插件静默失效
+        return True
+
+    def _is_access_allowed(self, message: dict) -> bool:
+        """群维度与用户维度都通过才允许解析。"""
+        access = self.config.access
+
+        group_id = get_group_id(message)
+        if not self._match_access_mode(
+            access.group_mode, group_id, access.group_whitelist, access.group_blacklist
+        ):
+            self.ctx.logger.debug(
+                "访问控制拦截：群 %s 未通过 group_mode=%s", group_id, access.group_mode
+            )
+            return False
+
+        user_id = get_user_id(message)
+        if not self._match_access_mode(
+            access.user_mode, user_id, access.user_whitelist, access.user_blacklist
+        ):
+            self.ctx.logger.debug(
+                "访问控制拦截：用户 %s 未通过 user_mode=%s", user_id, access.user_mode
+            )
+            return False
+
+        return True
 
     @staticmethod
     def _is_private_message(message: dict) -> bool:

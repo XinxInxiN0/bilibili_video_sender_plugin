@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import re
+import socket
+import ssl
 import subprocess
 import time
 import urllib.parse
@@ -16,6 +19,77 @@ from .auth import apply_set_cookie, build_cookie_header, has_login_cookie, norma
 from .ffmpeg import ffmpeg_manager
 
 _logger = logging.getLogger("plugin.bilibili_video_sender.parser")
+
+# 部分网络环境下 b23.tv 的系统 DNS 解析会被污染到无法连通的 IP，
+# 此时改用 DoH 查询真实 IP 并直连（SNI 与证书校验仍按真实域名走）。
+DEFAULT_DOH_SERVERS = [
+    "https://223.5.5.5/resolve",
+    "https://1.1.1.1/dns-query",
+]
+_DOH_CACHE_TTL = 300
+_doh_cache: Dict[str, Tuple[List[str], float]] = {}
+
+
+def _is_ipv4(value: str) -> bool:
+    parts = value.split(".")
+    if len(parts) != 4:
+        return False
+    return all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+
+
+def _doh_resolve(host: str, servers: Optional[List[str]] = None, timeout: int = 6) -> List[str]:
+    """通过 DoH 查询域名的 A 记录，带 TTL 缓存。"""
+    cached = _doh_cache.get(host)
+    if cached and cached[1] > time.time():
+        return cached[0]
+
+    for server in servers or DEFAULT_DOH_SERVERS:
+        query = f"{server}?name={urllib.parse.quote(host)}&type=A"
+        try:
+            req = urllib.request.Request(
+                query,
+                headers={"Accept": "application/dns-json", "User-Agent": "curl/8.0"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec - trusted DoH endpoint
+                payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        except Exception as exc:
+            _logger.debug("DoH 查询失败: server=%s, host=%s, err=%s", server, host, exc)
+            continue
+
+        ips = [
+            str(answer.get("data", ""))
+            for answer in payload.get("Answer", [])
+            if _is_ipv4(str(answer.get("data", "")))
+        ]
+        if ips:
+            _doh_cache[host] = (ips, time.time() + _DOH_CACHE_TTL)
+            _logger.info("DoH 解析 %s -> %s", host, ips[:3])
+            return ips
+
+    return []
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """连接到指定 IP，但 SNI 与证书校验仍使用真实域名。"""
+
+    def __init__(self, host: str, pinned_ip: str, **kwargs: Any):
+        super().__init__(host, **kwargs)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """明文 HTTP 版本的 IP 钉扎连接，Host 头仍为真实域名。"""
+
+    def __init__(self, host: str, pinned_ip: str, **kwargs: Any):
+        super().__init__(host, **kwargs)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self._pinned_ip, self.port), self.timeout)
 
 
 class BilibiliVideoInfo:
@@ -38,12 +112,18 @@ class BilibiliParser:
         "Chrome/144.0.0.0 Safari/537.36"
     )
 
+    SHORT_LINK_HOSTS = ("b23.tv", "bili2233.cn")
+
+    # 查询串排除引号/括号等字符：链接可能嵌在 JSON 卡片里，避免把 `"}}}` 一起吞进来
+    _QUERY_CHARS = r"[^\s#\"'<>{}\[\]\\`]+"
+
     VIDEO_URL_PATTERN = re.compile(
-        r"https?://(?:(?:www|m)\.)?bilibili\.com/video/(?P<bv>BV[\w]+|av\d+)(?:/)?(?:\?[^\s#]+)?",
+        r"(?:https?://)?(?:(?:www|m)\.)?bilibili\.com/video/(?P<bv>BV[\w]+|av\d+)(?:/)?"
+        rf"(?:\?{_QUERY_CHARS})?",
         re.IGNORECASE,
     )
     B23_SHORT_PATTERN = re.compile(
-        r"https?://b23\.tv/[\w]+(?:\?[^\s#]+)?",
+        rf"(?:https?://)?(?:b23\.tv|bili2233\.cn)/[\w-]+(?:\?{_QUERY_CHARS})?",
         re.IGNORECASE,
     )
     QN_TEXT_PATTERN = re.compile(r"(?:[?&]|\b)qn\s*=\s*(\d+)", re.IGNORECASE)
@@ -71,7 +151,24 @@ class BilibiliParser:
     @staticmethod
     def _sanitize_url(url: str) -> str:
         """清理 URL 尾部可能出现的标点符号。"""
-        return url.rstrip(").,，。!?》】】〕」\"'") if url else url
+        return url.rstrip(").,，。!?》】】〕」\"'}]>") if url else url
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        """补全缺失的协议头，保证下游 urllib 解析可用。"""
+        if not url:
+            return url
+        if re.match(r"^https?://", url, re.IGNORECASE):
+            return url
+        return f"https://{url}"
+
+    @staticmethod
+    def is_short_link(url: str) -> bool:
+        """判断是否为 B站官方短链域名。"""
+        if not url:
+            return False
+        host = (urllib.parse.urlparse(BilibiliParser._normalize_url(url)).hostname or "").lower()
+        return host in BilibiliParser.SHORT_LINK_HOSTS
 
     @staticmethod
     def extract_qn_from_text(text: str) -> Optional[int]:
@@ -312,11 +409,95 @@ class BilibiliParser:
         return json.loads(data.decode("utf-8", errors="ignore"))
 
     @staticmethod
-    def _follow_redirect(url: str) -> str:
-        """跟踪短链接跳转。"""
-        req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public short URL
-            return resp.geturl()
+    def _follow_redirect_via_doh(
+        url: str,
+        doh_servers: Optional[List[str]] = None,
+        max_hops: int = 5,
+    ) -> str:
+        """系统 DNS 不可用时的兜底：用 DoH 查真实 IP 后直连跟踪跳转。"""
+        last_error: Optional[Exception] = None
+        current = url
+
+        for _ in range(max_hops):
+            parsed = urllib.parse.urlparse(current)
+            host = parsed.hostname or ""
+            if not host:
+                raise ValueError(f"无法解析主机名: {current}")
+
+            # 已跳出短链域名即为目标地址，无需再请求一次落地页
+            if host.lower() not in BilibiliParser.SHORT_LINK_HOSTS:
+                return current
+
+            ips = _doh_resolve(host, doh_servers)
+            if not ips:
+                raise RuntimeError(f"DoH 未能解析域名: {host}")
+
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            is_plain_http = parsed.scheme.lower() == "http"
+            port = parsed.port or (80 if is_plain_http else 443)
+
+            response = None
+            for ip in ips[:3]:
+                conn = None
+                try:
+                    if is_plain_http:
+                        conn = _PinnedHTTPConnection(host, ip, port=port, timeout=15)
+                    else:
+                        conn = _PinnedHTTPSConnection(
+                            host,
+                            ip,
+                            port=port,
+                            timeout=15,
+                            context=ssl.create_default_context(),
+                        )
+                    conn.request(
+                        "GET",
+                        path,
+                        headers={"User-Agent": "curl/8.0", "Host": host},
+                    )
+                    resp = conn.getresponse()
+                    response = (resp.status, resp.getheader("Location"))
+                    conn.close()
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    _logger.debug("DoH 直连失败: ip=%s, host=%s, err=%s", ip, host, exc)
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+            if response is None:
+                raise last_error or RuntimeError(f"无法连接到 {host}")
+
+            status, location = response
+            if status in (301, 302, 303, 307, 308) and location:
+                current = urllib.parse.urljoin(current, location)
+                continue
+            return current
+
+        return current
+
+    @staticmethod
+    def _follow_redirect(
+        url: str,
+        doh_enabled: bool = True,
+        doh_servers: Optional[List[str]] = None,
+    ) -> str:
+        """跟踪短链接跳转，系统 DNS 失败时回退到 DoH 直连。"""
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public short URL
+                return resp.geturl()
+        except Exception as exc:
+            if not doh_enabled:
+                raise
+            _logger.warning("短链常规解析失败，尝试 DoH 兜底: url=%s, err=%s", url, exc)
+
+        return BilibiliParser._follow_redirect_via_doh(url, doh_servers)
 
     @staticmethod
     def _extract_bvid(url: str) -> Optional[str]:
@@ -333,11 +514,11 @@ class BilibiliParser:
         """从文本中提取第一个 B站视频链接。"""
         short = BilibiliParser.B23_SHORT_PATTERN.search(text)
         if short:
-            return BilibiliParser._sanitize_url(short.group(0))
+            return BilibiliParser._normalize_url(BilibiliParser._sanitize_url(short.group(0)))
 
         match = BilibiliParser.VIDEO_URL_PATTERN.search(text)
         if match:
-            return BilibiliParser._sanitize_url(match.group(0))
+            return BilibiliParser._normalize_url(BilibiliParser._sanitize_url(match.group(0)))
         return None
 
     @staticmethod

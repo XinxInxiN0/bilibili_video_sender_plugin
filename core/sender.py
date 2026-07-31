@@ -112,14 +112,14 @@ async def _send_text_via_onebot(
 
         is_private = _is_private_message(message)
         if is_private:
-            user_id = _get_user_id(message)
+            user_id = get_user_id(message)
             if not user_id:
                 _logger.error("私聊消息但无法获取用户 ID")
                 return False
             api_url = f"http://{host}:{port}/send_private_msg"
             request_data = {"user_id": user_id, "message": [{"type": "text", "data": {"text": content}}]}
         else:
-            group_id = _get_group_id(message)
+            group_id = get_group_id(message)
             if not group_id:
                 _logger.error("群聊消息但无法获取群 ID")
                 return False
@@ -192,14 +192,14 @@ async def _send_via_onebot(
 
     is_private = _is_private_message(message)
     if is_private:
-        user_id = _get_user_id(message)
+        user_id = get_user_id(message)
         if not user_id:
             _logger.error("Private message but unable to get user ID")
             return False
         api_url = f"http://{host}:{port}/send_private_msg"
         request_data = {"user_id": user_id, "message": [{"type": "video", "data": {"file": file_uri}}]}
     else:
-        group_id = _get_group_id(message)
+        group_id = get_group_id(message)
         if not group_id:
             _logger.error("Group message but unable to get group ID")
             return False
@@ -225,14 +225,14 @@ async def _upload_file_via_onebot(
 
     is_private = _is_private_message(message)
     if is_private:
-        user_id = _get_user_id(message)
+        user_id = get_user_id(message)
         if not user_id:
             _logger.error("Private message but unable to get user ID")
             return False
         api_url = f"http://{host}:{port}/upload_private_file"
         request_data = {"user_id": user_id, "file": file_uri, "name": file_name, "upload_file": True}
     else:
-        group_id = _get_group_id(message)
+        group_id = get_group_id(message)
         if not group_id:
             _logger.error("Group message but unable to get group ID")
             return False
@@ -317,7 +317,7 @@ def _is_private_message(message: dict[str, Any]) -> bool:
     return message_info.get("group_info") is None
 
 
-def _get_user_id(message: dict[str, Any]) -> str | None:
+def get_user_id(message: dict[str, Any]) -> str | None:
     """从消息中获取用户 ID。"""
     message_info = message.get("message_info", {})
     if not message_info:
@@ -329,7 +329,7 @@ def _get_user_id(message: dict[str, Any]) -> str | None:
     return str(user_id) if user_id else None
 
 
-def _get_group_id(message: dict[str, Any]) -> str | None:
+def get_group_id(message: dict[str, Any]) -> str | None:
     """从消息中获取群 ID。"""
     message_info = message.get("message_info", {})
     if not message_info:
