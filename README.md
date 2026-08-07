@@ -75,8 +75,7 @@ https://www.bilibili.com/video/BV18Cm8BHEeD/?qn=116
 5. 在左侧栏找到 `Cookies` 并展开。
 6. 找到 `bilibili` 相关的 Cookie 并点击。
 7. 在右侧的 `Value` 列复制 `SESSDATA`、`bili_jct`、`DedeUserID`、`DedeUserID__ckMd5`、`sid`、`buvid3`、`buvid4`。
-8. 在左侧栏找到 `Local Storage` → `https://www.bilibili.com`，复制 `ac_time_value`。
-9. 在插件目录的 `config.toml` 中找到 `[auth]`，按下面格式填写。
+8. 在插件目录的 `config.toml` 中找到 `[auth]`，按下面格式填写。
 
 ```toml
 [auth]
