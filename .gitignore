@@ -7,3 +7,4 @@ auth.json.tmp
 migration-guide.md
 guide.md
 /config_back
+/tmp
