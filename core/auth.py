@@ -244,13 +244,20 @@ class BilibiliAuthRefresher:
         if check.status != "refresh_required":
             return AuthRefreshResult(status=check.status, credentials={}, message=check.message)
 
-        missing = [name for name in ("bili_jct", "ac_time_value") if not creds.get(name)]
-        if missing:
+        if not creds.get("bili_jct"):
             return AuthRefreshResult(
                 status="missing_material",
                 credentials={},
-                message=f"缺少刷新凭据: {', '.join(missing)}",
+                message="缺少刷新凭据: bili_jct",
             )
+
+        if not creds.get("ac_time_value"):
+            # B站已废弃 ac_time_value，通过 keep-alive 请求捕获 Set-Cookie 保活
+            try:
+                return cls._keep_alive(creds)
+            except Exception as e:
+                return AuthRefreshResult(status="refresh_failed", credentials={}, message=f"keep-alive 失败: {e}")
+
         if not cls.cryptography_available():
             return AuthRefreshResult(
                 status="dependency_missing",
@@ -275,13 +282,19 @@ class BilibiliAuthRefresher:
         if not has_login_cookie(creds):
             return AuthRefreshResult(status="guest", credentials={}, message="未配置 B站登录凭据")
 
-        missing = [name for name in ("bili_jct", "ac_time_value") if not creds.get(name)]
-        if missing:
+        if not creds.get("bili_jct"):
             return AuthRefreshResult(
                 status="missing_material",
                 credentials={},
-                message=f"缺少刷新凭据: {', '.join(missing)}",
+                message="缺少刷新凭据: bili_jct",
             )
+
+        if not creds.get("ac_time_value"):
+            try:
+                return cls._keep_alive(creds)
+            except Exception as e:
+                return AuthRefreshResult(status="refresh_failed", credentials={}, message=f"keep-alive 失败: {e}")
+
         if not cls.cryptography_available():
             return AuthRefreshResult(
                 status="dependency_missing",
@@ -348,6 +361,40 @@ class BilibiliAuthRefresher:
 
         refreshed["updated_at"] = int(time.time())
         return AuthRefreshResult(status="refreshed", credentials=refreshed, refreshed=True)
+
+    @classmethod
+    def _keep_alive(cls, credentials: Dict[str, Any]) -> AuthRefreshResult:
+        """通过普通 API 请求捕获 Set-Cookie 来保活 Cookie（无需 ac_time_value）。"""
+        url = "https://api.bilibili.com/x/web-interface/nav"
+        cookie_header = build_cookie_header(credentials)
+        if not cookie_header:
+            return AuthRefreshResult(status="guest", credentials={}, message="无 Cookie 可保活")
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": _user_agent(),
+                "Referer": "https://www.bilibili.com/",
+                "Cookie": cookie_header,
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec - trusted public API
+            text = _read_response_text(resp)
+            response_headers = resp.headers
+
+        payload = json.loads(text)
+        if payload.get("code") != 0:
+            msg = str(payload.get("message") or f"code={payload.get('code')}")
+            return AuthRefreshResult(status="refresh_failed", credentials={}, message=f"keep-alive 登录态失效: {msg}")
+
+        updated = apply_set_cookie(credentials, response_headers)
+        if updated != credentials:
+            updated["updated_at"] = int(time.time())
+            _logger.info("Cookie 已通过 keep-alive 请求自动续期")
+            return AuthRefreshResult(status="refreshed", credentials=updated, refreshed=True)
+
+        _logger.debug("keep-alive 请求未返回新 Cookie，登录态仍有效")
+        return AuthRefreshResult(status="not_needed", credentials=credentials)
 
     @staticmethod
     def _build_correspond_path(timestamp_ms: int) -> str:

@@ -77,6 +77,8 @@ https://www.bilibili.com/video/BV18Cm8BHEeD/?qn=116
 7. 在右侧的 `Value` 列复制 `SESSDATA`、`bili_jct`、`DedeUserID`、`DedeUserID__ckMd5`、`sid`、`buvid3`、`buvid4`。
 8. 在插件目录的 `config.toml` 中找到 `[auth]`，按下面格式填写。
 
+> **注意**：`ac_time_value` 已废弃，B站不再在 localStorage 中提供此值，可留空。插件会通过定期 API 请求自动保活 Cookie。
+
 ```toml
 [auth]
 SESSDATA = ""
@@ -86,10 +88,10 @@ DedeUserID__ckMd5 = ""
 sid = ""
 buvid3 = ""
 buvid4 = ""
-ac_time_value = ""
+ac_time_value = ""  # 已废弃，可留空
 ```
 
-这些值等同于 B站登录凭据，不要发给别人，也不要提交到 Git 仓库。插件会自动把续期后的 Cookie 写回 `config.toml` 的 `[auth]`。
+这些值等同于 B站登录凭据，不要发给别人，也不要提交到 Git 仓库。插件会通过定期 keep-alive 请求自动保活 Cookie，并将更新后的值写回 `config.toml` 的 `[auth]`。
 
 
 ## 解析成功通知方式（v2.0.8+）

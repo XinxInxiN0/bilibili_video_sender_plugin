@@ -93,9 +93,9 @@ class BilibiliAuthConfig(PluginConfigBase):
     )
     ac_time_value: str = Field(
         default="",
-        description="B站 Local Storage 中的 ac_time_value",
+        description="已废弃，可留空。B站不再提供此值，插件会通过 keep-alive 自动保活 Cookie",
         json_schema_extra=_ui(
-            "ac_time_value", "B站 Local Storage 中的 ac_time_value", 7
+            "ac_time_value", "已废弃，可留空", 7
         ),
     )
 
@@ -590,25 +590,16 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             )
             return retry
 
-        missing = [
-            name for name in ("bili_jct", "ac_time_value") if not credentials.get(name)
-        ]
-        if missing:
-            self.ctx.logger.warning(
-                "B站 Cookie 需要续期，但缺少刷新凭据: %s", ", ".join(missing)
-            )
+        if not credentials.get("bili_jct"):
+            self.ctx.logger.warning("B站 Cookie 需要续期，但缺少 bili_jct")
             return retry
 
-        if not BilibiliAuthRefresher.cryptography_available():
-            self.ctx.logger.warning("B站 Cookie 需要续期，但当前环境缺少 cryptography")
-            return retry
-
-        snapshot_token = str(credentials.get("ac_time_value", ""))
+        snapshot_jct = str(credentials.get("bili_jct", ""))
         snapshot_updated = str(credentials.get("updated_at", ""))
         async with self._auth_lock:
             current = normalize_credentials(getattr(self, "_auth_credentials", {}))
             if (
-                str(current.get("ac_time_value", "")) != snapshot_token
+                str(current.get("bili_jct", "")) != snapshot_jct
                 or str(current.get("updated_at", "")) != snapshot_updated
             ):
                 self.ctx.logger.info("B站 Cookie 后台续期跳过：凭据已由其他任务更新")
@@ -662,27 +653,18 @@ class BilibiliVideoSenderPlugin(MaiBotPlugin):
             )
             return credentials, None
 
-        missing = [
-            name for name in ("bili_jct", "ac_time_value") if not credentials.get(name)
-        ]
-        if missing:
+        if not credentials.get("bili_jct"):
             return (
                 credentials,
-                f"B站 Cookie 需要续期，但 config.toml [auth] 缺少 {', '.join(missing)}；请管理员补全 B站登录凭据。",
+                "B站 Cookie 需要续期，但 config.toml [auth] 缺少 bili_jct；请管理员补全 B站登录凭据。",
             )
 
-        if not BilibiliAuthRefresher.cryptography_available():
-            return (
-                credentials,
-                "B站 Cookie 需要续期，但当前环境缺少 cryptography；请管理员执行 pip install cryptography 后重启插件。",
-            )
-
-        snapshot_token = str(credentials.get("ac_time_value", ""))
+        snapshot_jct = str(credentials.get("bili_jct", ""))
         snapshot_updated = str(credentials.get("updated_at", ""))
         async with self._auth_lock:
             current = normalize_credentials(getattr(self, "_auth_credentials", {}))
             if (
-                str(current.get("ac_time_value", "")) != snapshot_token
+                str(current.get("bili_jct", "")) != snapshot_jct
                 or str(current.get("updated_at", "")) != snapshot_updated
             ):
                 return current, None

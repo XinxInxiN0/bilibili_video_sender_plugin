@@ -55,7 +55,7 @@ return {"action": "abort"}  ← 阻止 maisaka 处理（block_ai_reply=True 时�
 
 ```
 PluginConfig
-├── BilibiliAuthConfig → SESSDATA, bili_jct, DedeUserID, sid, buvid3, buvid4, ac_time_value
+├── BilibiliAuthConfig → SESSDATA, bili_jct, DedeUserID, sid, buvid3, buvid4, ac_time_value(已废弃)
 ├── BilibiliConfig   → qn, group_at_only, block_ai_reply, 压缩/时长限制, Cookie 续期开关
 ├── ParserConfig     → enable_miniapp_card
 ├── FFmpegConfig     → 硬件加速、编码器优先级
